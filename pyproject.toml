@@ -1,0 +1,77 @@
+[tool.poetry]
+name = "exo-windows-porting"
+version = "0.1.0-alpha"
+description = "The Zero-Config Distributed LLM Framework for Windows + ROCm/CUDA"
+authors = ["Exo Windows Porting Team <team@exo-windows-porting.dev>"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/exo-explore/exo-windows-porting"
+homepage = "https://github.com/exo-explore/exo-windows-porting"
+keywords = ["llm", "distributed-inference", "rocm", "cuda", "windows"]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+pydantic = "^2.0.0"
+rich = "^13.0.0"
+typer = "^0.9.0"
+pyzmq = "^25.0.0"
+libp2p = "^0.1.0"
+zeroconf = "^0.96.0"
+llama-cpp-python = ">=0.2.87"
+numpy = "^1.24.0"
+diskcache = "^5.6.1"
+fastapi = "^0.109.0"
+uvicorn = {extras = ["standard"], version = "^0.27.0"}
+websockets = "^12.0"
+jinja2 = "^3.1.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.4.0"
+pytest-asyncio = "^0.23.0"
+httpx = "^0.26.0"
+coverage = "^7.0.0"
+black = "^24.1.0"
+ruff = "^0.3.0"
+mypy = "^1.8.0"
+pre-commit = "^3.6.0"
+
+[tool.poetry.scripts]
+exo-windows-porting = "exo_windows_porting.main:app"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 88
+target-version = ['py310', 'py311', 'py312']
+include = '\.pyi?$'
+exclude = '''
+/(
+    \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | _build
+  | buck-out
+  | build
+  | dist
+)/
+'''
+
+[tool.ruff]
+line-length = 88
+select = ["E", "F", "I", "N", "W"]
+ignore = ["E501", "E731"]  # Line too long, lambda assignments
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-v --cov=exo_windows_porting --cov-report=term-missing"

@@ -1,0 +1,108 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  test-linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: Install Poetry
+      run: |
+        curl -sSL https://install.python-poetry.org | python3 -
+        export PATH=$HOME/.local/bin:$PATH
+    
+    - name: Install dependencies
+      run: |
+        poetry install
+    
+    - name: Run tests with pytest
+      run: |
+        poetry run pytest -v --cov=exo_windows_porting --cov-report=xml
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+
+  test-windows:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: Install Poetry
+      run: |
+        curl -sSL https://install.python-poetry.org | python3 -
+        $env:PATH = "$home\.local\bin;$env:PATH"
+    
+    - name: Install dependencies
+      run: poetry install
+    
+    - name: Run tests with pytest
+      run: poetry run pytest -v --cov=exo_windows_porting --cov-report=xml
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    
+    - name: Install Poetry
+      run: |
+        curl -sSL https://install.python-poetry.org | python3 -
+        export PATH=$HOME/.local/bin:$PATH
+    
+    - name: Install dependencies
+      run: poetry install
+    
+    - name: Run Black
+      run: poetry run black --check exo_windows_porting/
+    
+    - name: Run Ruff
+      run: poetry run ruff check exo_windows_porting/
+    
+    - name: Run mypy
+      run: poetry run mypy exo_windows_porting/
+
+  build-docs:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    
+    - name: Install dependencies
+      run: poetry install
+    
+    - name: Build documentation
+      run: |
+        cd docs
+        make html
