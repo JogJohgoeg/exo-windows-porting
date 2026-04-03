@@ -172,18 +172,17 @@ async def process_inference_task(request: InferenceRequest, request_id: str):
         # Get backend factory
         factory = get_backend_factory()
         
-        # Create backend instance
-        if request.gpu_required:
-            selected_backend = "cuda" if factory.hardware.has_nvidia_gpu else ("rocm" if factory.hardware.has_amd_gpu else None)
-            if not selected_backend:
-                raise HTTPException(
-                    status_code=400, 
-                    detail="GPU required but no GPU available on this system"
-                )
-        else:
-            selected_backend = "cpu"  # Fallback to CPU
+        # Create backend instance with force_cpu if GPU not available when required
+        if request.gpu_required and (not factory.hardware.has_nvidia_gpu and not factory.hardware.has_amd_gpu):
+            raise HTTPException(
+                status_code=400, 
+                detail="GPU required but no GPU available on this system"
+            )
         
-        backend = factory.create_backend(request.model_path)
+        backend = factory.create_backend(
+            model_path=request.model_path,
+            force_cpu=(not request.gpu_required)  # Force CPU if GPU not requested
+        )
         
         # Execute inference
         start_time = time.time()
@@ -194,21 +193,33 @@ async def process_inference_task(request: InferenceRequest, request_id: str):
         elapsed_ms = (time.time() - start_time) * 1000
         
         # Calculate metrics
-        tokens_generated = len(result_text.split())
+        tokens_generated = len(result_text.split()) if result_text else 0
         throughput = tokens_generated / (elapsed_ms / 1000) if elapsed_ms > 0 else 0
         
         return {
             "success": True,
-            "text": result_text,
+            "text": result_text or "",
             "tokens_generated": tokens_generated,
             "time_ms": round(elapsed_ms, 2),
             "throughput_tok_s": round(throughput, 2)
         }
         
+    except HTTPException:
+        # Re-raise HTTP exceptions to be handled by FastAPI
+        raise
     except Exception as e:
+        import traceback
+        
+        # Log full traceback for debugging (in production, use proper logging)
+        print(f"Error processing inference task {request_id}: {e}")
+        traceback.print_exc()
+        
         return {
             "success": False,
-            "error_message": str(e)
+            "error_message": str(e),
+            "tokens_generated": 0,
+            "time_ms": 0.0,
+            "throughput_tok_s": 0.0
         }
 
 

@@ -19,6 +19,7 @@ class BackendConfig:
     
     # User preferences
     preferred_backend: Optional[str] = None  # "rocm", "cuda", or "cpu"
+    force_cpu: bool = False  # Force CPU-only mode regardless of hardware
     
     # Hardware constraints
     min_gpu_memory_mb: int = 4096  # Minimum required VRAM
@@ -37,13 +38,32 @@ class BackendRegistry:
     _backends: Dict[str, Type] = {}
     
     @classmethod
-    def register(cls, name: str):
-        """Decorator to register a backend class."""
+    def register(cls, name: str, backend_class: Optional[Type] = None):
+        """Register a backend class or use as decorator.
         
-        def decorator(backend_class: Type):
+        Usage 1 - Direct registration:
+            BackendRegistry.register("cuda", LLamaCudaBackend)
+            
+        Usage 2 - As decorator:
+            @BackendRegistry.register("cuda")
+            class LLamaCudaBackend:
+                pass
+        
+        Args:
+            name: Backend name identifier
+            backend_class: Backend class to register (optional if used as decorator)
+        """
+        
+        def decorator(backend: Type):
+            cls._backends[name] = backend
+            return backend
+        
+        # If called with a class directly, register it
+        if backend_class is not None:
             cls._backends[name] = backend_class
             return backend_class
         
+        # Otherwise, return decorator for use as @register decorator
         return decorator
     
     @classmethod
@@ -56,6 +76,7 @@ class BackendRegistry:
     def list_backends(cls) -> Dict[str, bool]:
         """List all available backends and their status."""
         
+        # Import here to avoid circular import
         from .backend_utils import detect_hardware
         
         hardware = detect_hardware()
@@ -139,20 +160,39 @@ class BackendFactory:
         self.config = config or BackendConfig()
         self.hardware = HardwareDetector()
         
-        # Initialize registry if not already done
-        from . import llama_rocm, llama_cuda
+        # Initialize registry if not already done (lazy import to avoid circular deps)
+        # Backend classes are imported lazily in create_backend method
         
-        BackendRegistry.register("rocm")
-        BackendRegistry.register("cuda")
-        BackendRegistry.register("cpu")
+        # Register backends that we know exist
+        from .llama_rocm import LLamaRocmBackend
+        from .llama_cuda import LLamaCudaBackend
+        from .llama_cpu import LLamaCpuBackend
+        
+        BackendRegistry.register("rocm", LLamaRocmBackend)
+        BackendRegistry.register("cuda", LLamaCudaBackend)
+        BackendRegistry.register("cpu", LLamaCpuBackend)
     
     def select_backend(self) -> str:
-        """Select the best available backend based on hardware and preferences."""
+        """Select the best available backend based on hardware and preferences.
         
-        # User preference takes priority if explicitly set
+        Returns:
+            Backend name ("cpu", "cuda", or "rocm")
+            
+        Raises:
+            ValueError: If GPU requested but not available
+        """
+        
+        # Force CPU mode takes priority
+        if self.config.force_cpu:
+            return "cpu"
+        
+        # User preference takes priority if explicitly set and available
         if self.config.preferred_backend:
             if self._is_available(self.config.preferred_backend):
                 return self.config.preferred_backend
+            else:
+                # Preferred backend not available, fall through to auto-detection
+                pass
         
         # Hardware-based selection (priority order)
         if self.hardware.has_nvidia_gpu:
@@ -174,8 +214,28 @@ class BackendFactory:
         
         return True  # CPU always available
     
-    def create_backend(self, model_path: str) -> Any:
-        """Create a backend instance based on hardware detection."""
+    def create_backend(self, model_path: str, force_cpu: bool = False) -> Any:
+        """Create a backend instance based on hardware detection.
+        
+        Args:
+            model_path: Path to the GGUF model file
+            force_cpu: Force CPU-only mode regardless of GPU availability
+            
+        Returns:
+            Backend instance (LLamaCpuBackend, LLamaRocmBackend, or LLamaCudaBackend)
+            
+        Raises:
+            ValueError: If GPU requested but not available and not forced to CPU
+        """
+        
+        if force_cpu:
+            from .llama_cpu import LLamaCpuBackend
+            
+            return LLamaCpuBackend(
+                model_path=model_path,
+                n_ctx=self.config.n_ctx,
+                verbose=self.config.verbose
+            )
         
         selected = self.select_backend()
         
@@ -197,7 +257,7 @@ class BackendFactory:
                 n_ctx=self.config.n_ctx
             )
         
-        else:  # cpu
+        else:  # cpu fallback
             from .llama_cpu import LLamaCpuBackend
             
             return LLamaCpuBackend(
@@ -209,6 +269,14 @@ class BackendFactory:
     def get_backend_info(self) -> Dict[str, Any]:
         """Get information about available backends."""
         
+        # Determine selected backend considering force_cpu and preferred_backend
+        if self.config.force_cpu:
+            selected = "cpu"
+        elif self.config.preferred_backend and self._is_available(self.config.preferred_backend):
+            selected = self.config.preferred_backend
+        else:
+            selected = self.select_backend()
+        
         return {
             "hardware": {
                 "has_amd_gpu": self.hardware.has_amd_gpu,
@@ -218,7 +286,11 @@ class BackendFactory:
             },
             "available_backends": {name: available 
                                    for name, available in BackendRegistry.list_backends().items()},
-            "selected_backend": self.select_backend() if not self.config.preferred_backend else self.config.preferred_backend
+            "selected_backend": selected,
+            "config": {
+                "force_cpu": self.config.force_cpu,
+                "preferred_backend": self.config.preferred_backend
+            }
         }
 
 
