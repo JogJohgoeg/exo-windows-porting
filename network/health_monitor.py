@@ -126,41 +126,87 @@ class HealthMonitor:
                 await asyncio.sleep(5)  # Back off on error
     
     async def _check_node(self, node_id: str) -> None:
-        """Check health of a specific node"""
+        """Check health of a specific node
+        
+        Args:
+            node_id: ID of the node to check
+            
+        Returns:
+            HealthStatus object with current status
+            
+        Notes:
+            Triggers callbacks when node state changes (healthy ↔ unhealthy)
+        """
         
         try:
-            start_time = time.time()
+            import time as time_module
+            
+            start_time = time_module.time()
             
             # Send ping request (simplified implementation)
             latency = await self._send_ping(node_id)
             
-            elapsed_ms = (time.time() - start_time) * 1000
+            elapsed_ms = (time_module.time() - start_time) * 1000
             
             # Update status if healthy
             old_status = self.node_status.get(node_id)
             
+            # Detect state transition: unhealthy → healthy
             if old_status and not old_status.is_healthy:
                 print(f"✅ Node {node_id} recovered")
                 
                 if self.on_node_healthy:
-                    await self.on_node_healthy(node_id)
+                    try:
+                        await self.on_node_healthy(node_id)
+                    except Exception as callback_error:
+                        print(f"❌ Error in on_node_healthy callback for {node_id}: {callback_error}")
             
-            # Create new status
-            self.node_status[node_id] = HealthStatus(
+            # Detect state transition: healthy → unhealthy (first time check)
+            elif old_status is None and not self.node_status.get(node_id, HealthStatus(
+                node_id=node_id, is_healthy=True, last_check_time=0
+            )).is_healthy:
+                print(f"⚠️ Node {node_id} first seen as unhealthy")
+                
+                if self.on_node_unhealthy:
+                    try:
+                        await self.on_node_unhealthy(node_id, "First check failed")
+                    except Exception as callback_error:
+                        print(f"❌ Error in on_node_unhealthy callback for {node_id}: {callback_error}")
+            
+            # Create or update status
+            new_status = HealthStatus(
                 node_id=node_id,
-                is_healthy=True,
-                last_check_time=time.time(),
+                is_healthy=True,  # Will be updated below if check fails
+                last_check_time=time_module.time(),
                 ping_latency_ms=latency or elapsed_ms
             )
             
+            self.node_status[node_id] = new_status
+            
         except Exception as e:
+            import traceback
+            
             print(f"❌ Node {node_id} health check failed: {e}")
+            traceback.print_exc()
             
             # Update status to unhealthy
+            old_status = self.node_status.get(node_id)
+            
+            # Detect state transition: healthy → unhealthy
+            if old_status and old_status.is_healthy:
+                print(f"⚠️ Node {node_id} now unhealthy")
+                
+                if self.on_node_unhealthy:
+                    try:
+                        await self.on_node_unhealthy(node_id, str(e))
+                    except Exception as callback_error:
+                        print(f"❌ Error in on_node_unhealthy callback for {node_id}: {callback_error}")
+            
+            # Create unhealthy status (or update existing)
             self.node_status[node_id] = HealthStatus(
                 node_id=node_id,
                 is_healthy=False,
-                last_check_time=time.time(),
+                last_check_time=time_module.time(),
                 error_message=str(e)
             )
     

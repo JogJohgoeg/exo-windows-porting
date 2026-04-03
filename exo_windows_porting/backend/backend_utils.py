@@ -40,7 +40,16 @@ class SystemInfo:
 
 
 def detect_hardware() -> SystemInfo:
-    """Detect available GPU hardware on the system."""
+    """Detect available GPU hardware on the system.
+    
+    Returns:
+        SystemInfo object with detected hardware information
+        
+    Notes:
+        - NVIDIA detection via nvidia-smi (Windows/Linux/macOS)
+        - AMD detection via dxdiag on Windows only
+        - Gracefully handles missing or malformed output
+    """
     
     info = SystemInfo()
     
@@ -58,20 +67,49 @@ def detect_hardware() -> SystemInfo:
             
             for line in result.stdout.strip().split("\n"):
                 parts = [p.strip() for p in line.split(",")]
+                
+                # Validate we have enough fields before parsing
                 if len(parts) >= 3:
-                    device_id = int(parts[0])
-                    name = parts[1]
-                    memory_mb = int(parts[2].replace(" MiB", ""))
-                    
-                    info.nvidia_devices.append({
-                        "id": device_id,
-                        "name": name,
-                        "memory_total_mb": memory_mb
-                    })
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        pass
+                    try:
+                        device_id = int(parts[0])
+                        name = parts[1]
+                        memory_mb_str = parts[2].replace(" MiB", "").replace(" MB", "")
+                        
+                        # Handle cases where memory field might be empty or invalid
+                        if memory_mb_str and memory_mb_str.isdigit():
+                            memory_mb = int(memory_mb_str)
+                            
+                            info.nvidia_devices.append({
+                                "id": device_id,
+                                "name": name,
+                                "memory_total_mb": memory_mb
+                            })
+                    except (ValueError, IndexError):
+                        # Skip malformed lines
+                        print(f"⚠️ Skipping malformed nvidia-smi line: {line}")
+                        continue
+                elif len(parts) == 2 and parts[0].strip():
+                    # Handle case where memory.total is not available
+                    try:
+                        device_id = int(parts[0])
+                        name = parts[1]
+                        
+                        info.nvidia_devices.append({
+                            "id": device_id,
+                            "name": name,
+                            "memory_total_mb": 0  # Unknown
+                        })
+                    except ValueError:
+                        pass
+                        
+    except subprocess.TimeoutExpired:
+        print("⚠️ NVIDIA GPU detection timed out (nvidia-smi took >5s)")
+    except FileNotFoundError:
+        print("ℹ️ nvidia-smi not found - no NVIDIA GPUs detected")
+    except Exception as e:
+        print(f"⚠️ Error detecting NVIDIA GPUs: {e}")
     
-    # Check for AMD GPU (Windows)
+    # Check for AMD GPU (Windows only)
     if info.os == "Windows":
         try:
             result = subprocess.run(
@@ -92,8 +130,14 @@ def detect_hardware() -> SystemInfo:
                     stripped = line.strip()
                     if any(keyword in stripped.upper() for keyword in ["AMD", "RADEON"]):
                         info.amd_devices.append({"name": stripped})
-        except (subprocess.TimeoutExpired, Exception):
-            pass
+                        
+        except subprocess.TimeoutExpired:
+            print("⚠️ AMD GPU detection timed out (dxdiag took >10s)")
+        except Exception as e:
+            print(f"⚠️ Error detecting AMD GPUs: {e}")
+    else:
+        # On non-Windows systems, skip AMD detection but don't error
+        pass
     
     return info
 

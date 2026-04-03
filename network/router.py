@@ -164,7 +164,21 @@ class SimpleRouter:
         return filtered
     
     def _select_best_node(self, nodes: List[Dict], task_request: TaskRequest) -> Dict:
-        """Select the best node based on current strategy"""
+        """Select the best node based on current strategy
+        
+        Args:
+            nodes: List of candidate nodes (must not be empty)
+            task_request: The task request being routed
+            
+        Returns:
+            Best matching node from the list
+            
+        Raises:
+            ValueError: If nodes list is empty
+        """
+        
+        if not nodes:
+            raise ValueError("Cannot select best node from empty list")
         
         if self.strategy == "random":
             return random.choice(nodes)
@@ -187,7 +201,9 @@ class SimpleRouter:
             return sorted_nodes[0] if sorted_nodes else nodes[0]
         
         else:
-            # Fallback to random
+            # Fallback to random with safety check
+            if not nodes:
+                raise ValueError("No nodes available for selection")
             return random.choice(nodes)
     
     def _calculate_confidence(self, selected: Dict, all_candidates: List[Dict]) -> float:
@@ -211,7 +227,14 @@ class SimpleRouter:
         return min(1.0, max(0.0, confidence))
     
     def _get_selection_value(self, node: Dict) -> float:
-        """Get a numeric value for the node based on current strategy"""
+        """Get a numeric value for the node based on current strategy
+        
+        Args:
+            node: Node information dictionary
+            
+        Returns:
+            Numeric value representing node suitability
+        """
         
         if self.strategy == "least_loaded":
             # Higher is better (inverse of load)
@@ -219,12 +242,15 @@ class SimpleRouter:
         
         elif self.strategy == "gpu_memory_available":
             # Higher is better (more GPU memory)
-            return node.get("gpu_memory_total", 0)
+            return float(node.get("gpu_memory_total", 0))
         
         else:  # random
-            # Random value for confidence calculation
-            import random
-            return random.random()
+            # For random strategy, use a deterministic value to avoid confidence calculation issues
+            # Use node_id hash for consistency across calls
+            import hashlib
+            node_id = node.get("node_id", "")
+            hash_value = int(hashlib.md5(node_id.encode()).hexdigest(), 16)
+            return (hash_value % 1000) / 1000.0  # Return value between 0 and 1
 
 
 class LoadBalancer:
@@ -277,15 +303,27 @@ class LoadBalancer:
         print(f"✅ Added node: {node_id}")
     
     async def remove_node(self, node_id: str) -> None:
-        """Remove a node from the load balancer"""
+        """Remove a node from the load balancer
+        
+        Args:
+            node_id: ID of the node to remove
+            
+        Returns:
+            None
+            
+        Notes:
+            Silently ignores if node doesn't exist (no-op)
+        """
         
         if node_id not in self.nodes:
-            print(f"⚠️ Node {node_id} does not exist")
+            print(f"⚠️ Node {node_id} does not exist, skipping removal")
             return
         
+        # Clean up health tracking
+        self.node_health.pop(node_id, None)
+        self.node_failures.pop(node_id, None)
+        
         del self.nodes[node_id]
-        del self.node_health[node_id]
-        del self.node_failures[node_id]
         
         print(f"❌ Removed node: {node_id}")
     

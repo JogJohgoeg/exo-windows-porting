@@ -185,7 +185,7 @@ class PeerDiscoveryManager:
                 b'port': str(self.port).encode(),
                 b'host': self.host.encode(),
                 b'version': b'0.1.0-alpha',
-                b'timestamp': datetime.utcnow().isoformat().encode()
+                b'timestamp': datetime.now().astimezone().isoformat().encode()  # Fixed: Use timezone-aware datetime
             }
             
             # 注册 mDNS 服务
@@ -247,7 +247,7 @@ class PeerDiscoveryManager:
                 node_id=node_id,
                 host=info.addresses[0].decode() if info.addresses else '127.0.0.1',
                 port=info.port,
-                last_seen=datetime.utcnow().timestamp(),
+                last_seen=datetime.now().astimezone().timestamp(),  # Fixed: Use timezone-aware datetime
                 status="discovered"
             )
             
@@ -268,12 +268,30 @@ class PeerDiscoveryManager:
                     del self.peers[node_id]
                     print(f"⚠️ Peer lost: {node_id}")
                     
-                    # 触发回调
-                    if self.on_peer_lost and asyncio.get_event_loop().is_running():
-                        asyncio.create_task(self.on_peer_lost(node_id))
+                    # 触发回调 - 使用安全的异步调用方式
+                    if self.on_peer_lost:
+                        try:
+                            loop = asyncio.get_running_loop()
+                            # 在运行中的事件循环中调度任务
+                            asyncio.create_task(self.on_peer_lost(node_id))
+                        except RuntimeError:
+                            # 没有运行中的事件循环，使用 create_task 或同步处理
+                            import threading
+                            threading.Thread(
+                                target=lambda: self._run_callback_async(node_id),
+                                daemon=True
+                            ).start()
                         
         except Exception as e:
             print(f"❌ Error processing lost service: {e}")
+    
+    async def _run_callback_async(self, node_id: str) -> None:
+        """在后台线程中安全运行异步回调"""
+        
+        try:
+            await self.on_peer_lost(node_id)
+        except Exception as e:
+            print(f"❌ Error in peer lost callback for {node_id}: {e}")
     
     async def discover_peers(self, timeout: float = 5.0) -> List[PeerNodeInfo]:
         """
@@ -299,7 +317,7 @@ class PeerDiscoveryManager:
                     node_id=service.node_id,
                     host=service.host,
                     port=service.port,
-                    last_seen=datetime.utcnow().timestamp(),
+                    last_seen=datetime.now().astimezone().timestamp(),  # Fixed: Use timezone-aware datetime
                     status="discovered"
                 )
                 
