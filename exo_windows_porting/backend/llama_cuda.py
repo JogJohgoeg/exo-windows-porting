@@ -7,54 +7,67 @@ Author: Exo Windows Porting Team
 License: MIT
 """
 
-from typing import Optional, Dict, List, Any
+import logging
 import os
+import time
+
+from .base import LLMBackend
+
+logger = logging.getLogger(__name__)
 
 
-class LLamaCudaBackend:
+class LLamaCudaBackend(LLMBackend):
     """llama.cpp CUDA backend wrapper."""
-    
-    def __init__(self, model_path: str, device_id: int = 0):
+
+    def __init__(self, model_path: str, device_id: int = 0, n_ctx: int = 8192):
         self.model_path = model_path
         self.device_id = device_id
-        
-        # Initialize llama-cpp-python with CUDA support
+        self.n_ctx = n_ctx
+
+        os.environ.setdefault("CUDA_VISIBLE_DEVICES", str(device_id))
+
         try:
             from llama_cpp import Llama
-            
+
             self.llm = Llama(
                 model_path=model_path,
-                n_gpu_layers=-1,  # All layers to GPU (-1 = all)
-                n_ctx=8192,
-                verbose=False
+                n_gpu_layers=-1,
+                n_ctx=n_ctx,
+                verbose=False,
             )
-            
-            print(f"✅ CUDA backend initialized for device {device_id}")
-            
+
+            logger.info("CUDA backend initialized (device=%d, model=%s)", device_id, model_path)
+
         except ImportError as e:
             raise ImportError(
-                "llama-cpp-python not installed with CUDA support. "
-                "Install with:\n"
-                f"pip install llama-cpp-python --index-url https://abetlen.github.io/llama-cpp-python/whl/cu121"
+                "llama-cpp-python is not installed with CUDA support.\n"
+                "Install the CUDA wheel:\n"
+                "  pip install llama-cpp-python "
+                "--index-url https://abetlen.github.io/llama-cpp-python/whl/cu121"
             ) from e
-    
+
+    # ------------------------------------------------------------------
+    # LLMBackend interface
+    # ------------------------------------------------------------------
+
+    def get_backend_name(self) -> str:
+        return "cuda"
+
     async def generate(self, prompt: str, max_tokens: int = 512) -> str:
         """Generate text using CUDA-accelerated llama.cpp."""
-        
-        import time
-        
-        start_time = time.time()
-        
+        start = time.monotonic()
+
         result = self.llm(
             prompt=prompt,
             max_tokens=max_tokens,
             stop=None,
-            echo=False
+            echo=False,
         )
-        
-        elapsed_ms = (time.time() - start_time) * 1000
-        
-        return result['choices'][0]['text']
+
+        elapsed_ms = (time.monotonic() - start) * 1000
+        logger.debug("CUDA generation finished in %.1f ms", elapsed_ms)
+
+        return result["choices"][0]["text"]
 
 
 # Factory function for creating CUDA backend instances

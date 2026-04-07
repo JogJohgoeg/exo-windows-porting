@@ -8,6 +8,8 @@ Author: Exo Windows Porting Team
 License: MIT
 """
 
+import logging
+
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -15,6 +17,8 @@ from typing import Optional, List, Dict, Any
 import asyncio
 import time
 import uuid
+
+logger = logging.getLogger(__name__)
 
 
 # Pydantic Models for Request/Response
@@ -208,11 +212,7 @@ async def process_inference_task(request: InferenceRequest, request_id: str):
         # Re-raise HTTP exceptions to be handled by FastAPI
         raise
     except Exception as e:
-        import traceback
-        
-        # Log full traceback for debugging (in production, use proper logging)
-        print(f"Error processing inference task {request_id}: {e}")
-        traceback.print_exc()
+        logger.exception("Error processing inference task %s", request_id)
         
         return {
             "success": False,
@@ -316,7 +316,7 @@ async def startup_event():
     import time as time_module
     
     _cluster_status.uptime_seconds = 0.0
-    print(f"🚀 Exo Windows Porting API started at {time.strftime('%H:%M:%S')}")
+    logger.info("Exo Windows Porting API started at %s", time.strftime("%H:%M:%S"))
 
 
 # Shutdown event
@@ -324,4 +324,4 @@ async def startup_event():
 async def shutdown_event():
     """Cleanup on shutdown."""
     
-    print(f"🛑 Exo Windows Porting API stopped at {time.strftime('%H:%M:%S')}")
+    logger.info("Exo Windows Porting API stopped at %s", time.strftime("%H:%M:%S"))
