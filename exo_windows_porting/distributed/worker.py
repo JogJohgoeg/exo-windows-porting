@@ -6,14 +6,18 @@ A worker:
   2. BINDs a ZMQ PULL socket → receives activations from the previous node.
   3. Runs the forward pass on its layers.
   4. Sends hidden states (or logits) to the next node via PUSH.
-
-For the last worker, logits are sent to the coordinator's LogitsReceiver.
+  5. On a FINISHED signal: evicts KV cache and forwards the signal downstream.
 
 Worker lifecycle
 ----------------
-    worker = PipelineWorker(shard, model_id, coordinator_host, coordinator_results_port)
-    await worker.start()      # load model, bind sockets, warm up
-    await worker.run()        # event loop — blocks until stop() called
+    worker = PipelineWorker(
+        shard, model_id,
+        next_worker_host="192.168.1.11",
+        next_worker_port=29501,          # explicit: no +1 guessing
+        coordinator_host="192.168.1.1",
+    )
+    await worker.start()
+    await worker.run()      # blocks until stop() called
     await worker.stop()
 """
 
@@ -21,7 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import torch
 
@@ -31,12 +35,12 @@ from .transport import (
     ActivationReceiver,
     ActivationSender,
     LogitsSender,
+    TensorMessage,
 )
 
 logger = logging.getLogger(__name__)
 
-# request_id → per-layer KV cache (kept between decode steps)
-_KVStore = Dict[str, List[Optional[KVCache]]]
+_KVStore = Dict[str, Optional[List]]
 
 
 class PipelineWorker:
@@ -44,14 +48,19 @@ class PipelineWorker:
     Runs one stage of the distributed inference pipeline.
 
     Args:
-        shard:                  This worker's ModelShard descriptor.
-        model_id:               HuggingFace model ID or local path.
-        next_worker_host:       Host of the next pipeline stage.
-                                Ignored if this is the last shard.
-        coordinator_host:       Host of the coordinator — used by the last shard
-                                to send logits back.
+        shard:                    This worker's ModelShard descriptor.
+        model_id:                 HuggingFace model ID or local path.
+        next_worker_host:         Host of the next pipeline stage.
+                                  Required for non-last shards.
+        next_worker_port:         ZMQ port of the next stage's PULL socket.
+                                  Required for non-last shards.
+                                  (No more guessing via +1.)
+        coordinator_host:         Host of the coordinator — used by the last
+                                  shard to send logits back.
         coordinator_results_port: Port the coordinator listens on for logits.
-        device:                 Torch device string ("cuda", "cuda:1", "cpu", …).
+        device:                   Torch device string.
+        recv_timeout_ms:          How long to wait for an upstream message
+                                  before raising TimeoutError (0 = forever).
     """
 
     def __init__(
@@ -60,23 +69,26 @@ class PipelineWorker:
         model_id: str,
         *,
         next_worker_host: Optional[str] = None,
+        next_worker_port: Optional[int] = None,
         coordinator_host: str = "127.0.0.1",
         coordinator_results_port: int = 29600,
         device: str = "cuda",
+        recv_timeout_ms: int = 30_000,
     ):
         self.shard = shard
         self.model_id = model_id
         self.next_worker_host = next_worker_host
+        self.next_worker_port = next_worker_port
         self.coordinator_host = coordinator_host
         self.coordinator_results_port = coordinator_results_port
         self.device = device
+        self.recv_timeout_ms = recv_timeout_ms
 
         self._model: Optional[ShardedModel] = None
         self._receiver: Optional[ActivationReceiver] = None
         self._sender: Optional[ActivationSender] = None
         self._logits_sender: Optional[LogitsSender] = None
 
-        # KV cache store: {request_id: [kv_per_layer, ...]}
         self._kv_store: _KVStore = {}
         self._running = False
 
@@ -86,10 +98,11 @@ class PipelineWorker:
 
     async def start(self) -> None:
         """Load model shard and bind network sockets."""
-        logger.info("Starting worker for shard %s on device=%s", self.shard, self.device)
+        logger.info("Starting worker %s (device=%s)", self.shard, self.device)
 
-        # Load shard (CPU-intensive — run in executor to not block event loop)
         loop = asyncio.get_event_loop()
+
+        # Load model in thread so we don't block the event loop
         self._model = await loop.run_in_executor(
             None, lambda: ShardedModel(self.shard, self.model_id, self.device)
         )
@@ -97,29 +110,23 @@ class PipelineWorker:
         # Bind incoming activation socket
         self._receiver = ActivationReceiver(self.shard.inference_port)
 
-        # Connect outgoing socket
+        # Connect outgoing socket (explicit port — no guessing)
         if not self.shard.is_last:
-            assert self.next_worker_host is not None, "next_worker_host required for non-last shards"
-            next_shard_idx = None
-            for i, _ in enumerate([self.shard]):
-                next_shard_idx = self.shard.inference_port + 1
-                break
-            # The next worker's inference_port is shard.inference_port+1 by convention
-            # (set by assign_shards which increments base_port sequentially)
-            # We receive the actual address from the coordinator at start() time.
-            # For simplicity: coordinator passes next_worker_host at construction.
-            # We infer port as inference_port + 1; this matches assign_shards layout.
-            next_port = self.shard.inference_port + 1
+            if self.next_worker_host is None or self.next_worker_port is None:
+                raise ValueError(
+                    f"next_worker_host and next_worker_port are required "
+                    f"for non-last shard {self.shard.node_id}"
+                )
             self._sender = ActivationSender(
-                f"tcp://{self.next_worker_host}:{next_port}"
+                f"tcp://{self.next_worker_host}:{self.next_worker_port}"
             )
         else:
             self._logits_sender = LogitsSender(
                 self.coordinator_host, self.coordinator_results_port
             )
 
-        # Optional: warmup to trigger CUDA JIT
-        loop.run_in_executor(None, self._model.warmup)
+        # Warm up GPU (JIT kernels) — properly awaited
+        await loop.run_in_executor(None, self._model.warmup)
 
         self._running = True
         logger.info("Worker %s ready", self.shard.node_id)
@@ -139,51 +146,70 @@ class PipelineWorker:
     # ------------------------------------------------------------------
 
     async def run(self) -> None:
-        """
-        Receive activation → forward → send output.
-        Loops until stop() is called.
-        """
+        """Receive → forward → send.  Loops until stop() is called."""
         logger.info("Worker %s entering run loop", self.shard.node_id)
         while self._running:
             try:
                 await self._process_one()
             except asyncio.CancelledError:
                 break
+            except TimeoutError as exc:
+                # Log but keep running; upstream may be temporarily slow
+                logger.warning("Worker %s recv timeout: %s", self.shard.node_id, exc)
             except Exception as exc:
-                logger.exception("Worker %s error: %s", self.shard.node_id, exc)
+                logger.exception("Worker %s unexpected error: %s", self.shard.node_id, exc)
+                # Brief back-off before retrying, so we don't spin-loop on a
+                # persistent failure (e.g. broken socket on the wrong port).
+                await asyncio.sleep(0.5)
 
     # ------------------------------------------------------------------
     # Single step
     # ------------------------------------------------------------------
 
     async def _process_one(self) -> None:
-        """Receive one activation, run forward, send output."""
-        request_id, activation = await self._receiver.recv()
+        """Receive one message, act on it, send output."""
+        msg: TensorMessage = await self._receiver.recv(
+            timeout_ms=self.recv_timeout_ms
+        )
 
-        with torch.no_grad():
-            output, new_kv = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self._forward(request_id, activation),
+        if msg.finished:
+            # ── Evict KV cache and propagate the signal downstream ──────
+            self.clear_kv_cache(msg.request_id)
+            if not self.shard.is_last:
+                await self._sender.send_finished(msg.request_id)
+            else:
+                await self._logits_sender.send_finished(msg.request_id)
+            logger.debug(
+                "Worker %s: evicted KV cache for %s",
+                self.shard.node_id, msg.request_id,
             )
+            return
 
-        # Update KV cache for this request
+        # ── Normal inference ─────────────────────────────────────────
+        request_id = msg.request_id
+        activation = msg.tensor
+
+        output, new_kv = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: self._forward(request_id, activation)
+        )
+
+        # Persist KV cache for next decode step
         if new_kv is not None:
             self._kv_store[request_id] = new_kv
 
-        # Send output to next stage
         if self.shard.is_last:
             await self._logits_sender.send(request_id, output)
         else:
             await self._sender.send(request_id, output)
 
-    def _forward(
-        self, request_id: str, activation: torch.Tensor
-    ) -> Tuple[torch.Tensor, Optional[List]]:
-        """Synchronous forward pass (runs in executor thread)."""
+    # ------------------------------------------------------------------
+    # Forward pass (runs in executor thread)
+    # ------------------------------------------------------------------
+
+    def _forward(self, request_id: str, activation: torch.Tensor):
         past_kv = self._kv_store.get(request_id)
 
         if self.shard.is_first:
-            # activation is token IDs (int64) for first shard
             output, new_kv = self._model(
                 input_ids=activation.long(),
                 past_key_values=past_kv,
@@ -196,6 +222,16 @@ class PipelineWorker:
 
         return output, new_kv
 
+    # ------------------------------------------------------------------
+    # Cache management
+    # ------------------------------------------------------------------
+
     def clear_kv_cache(self, request_id: str) -> None:
-        """Release KV cache for a finished request."""
-        self._kv_store.pop(request_id, None)
+        """Release KV tensors for a finished request and free VRAM."""
+        if request_id in self._kv_store:
+            del self._kv_store[request_id]
+            if self.device.startswith("cuda"):
+                torch.cuda.empty_cache()
+            logger.debug(
+                "Worker %s: KV cache evicted for %s", self.shard.node_id, request_id
+            )
