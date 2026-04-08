@@ -135,13 +135,11 @@ class TestAssignShards:
 class TestTensorSerialization:
     """_serialize / _deserialize must be exact inverses."""
 
-    from exo_windows_porting.distributed.transport import _deserialize, _serialize
-
     def _rt(self, tensor: torch.Tensor, rid: str = "req-001"):
         from exo_windows_porting.distributed.transport import _deserialize, _serialize
         raw = _serialize(rid, tensor)
-        got_rid, got_tensor = _deserialize(raw)
-        return got_rid, got_tensor
+        msg = _deserialize(raw)
+        return msg.request_id, msg.tensor
 
     def test_float16_roundtrip(self):
         t = torch.randn(1, 8, 4096, dtype=torch.float16)
@@ -212,8 +210,8 @@ class TestZMQTransportLoopback:
 
             async def _exchange():
                 await sender.send(rid, tensor)
-                got_rid, got_tensor = await receiver.recv()
-                return got_rid, got_tensor
+                msg = await receiver.recv()
+                return msg.request_id, msg.tensor
 
             got_rid, got_tensor = _run(_exchange())
             assert got_rid == rid
@@ -244,8 +242,8 @@ class TestZMQTransportLoopback:
                     await sender.send(f"req-{i}", t)
                 results = []
                 for _ in tensors:
-                    rid, t = await receiver.recv()
-                    results.append((rid, int(t.item())))
+                    msg = await receiver.recv()
+                    results.append((msg.request_id, int(msg.tensor.item())))
                 return results
 
             results = _run(_exchange())
@@ -426,21 +424,10 @@ class TestDistributedPipelineEngine:
         assert "distributed" in name.lower()
 
     def test_from_nodes_returns_engine(self):
-        """from_nodes() with a mocked AutoConfig must return DistributedPipelineEngine."""
+        """Constructing an engine from a topology must return DistributedPipelineEngine."""
         from exo_windows_porting.distributed.pipeline import DistributedPipelineEngine
-
-        fake_config = MagicMock()
-        fake_config.num_hidden_layers = 32
-
-        # Patch at the call site inside pipeline.py, not in the transformers package
-        with patch(
-            "exo_windows_porting.distributed.pipeline.DistributedPipelineEngine.from_nodes",
-            wraps=None,
-        ):
-            pass  # skip wraps check; do a direct functional test below
-
-        # Functional test: bypass transformers by constructing topology directly
         from exo_windows_porting.distributed.shard import assign_shards
+
         nodes = [
             {"node_id": "n0", "host": "127.0.0.1", "gpu_memory_mb": 8192},
             {"node_id": "n1", "host": "127.0.0.2", "gpu_memory_mb": 8192},
@@ -510,19 +497,28 @@ class TestMockGeneration:
         token_sequence = [42, 17, 2]   # last is EOS
         call_count = {"n": 0}
 
+        from exo_windows_porting.distributed.transport import TensorMessage
+
         async def fake_send(rid, tensor):
             pass
 
-        async def fake_recv():
+        async def fake_send_finished(rid):
+            pass
+
+        async def fake_recv(timeout_ms=30_000):
             i = call_count["n"]
             call_count["n"] += 1
+            # After generation tokens, return a FINISHED echo when asked
+            if i >= len(token_sequence):
+                return TensorMessage(request_id="req-x", tensor=None, finished=True)
             # Return dummy logits with the desired token as argmax
             logits = torch.full((1, 1, 100), -100.0)
-            logits[0, 0, token_sequence[min(i, len(token_sequence) - 1)]] = 100.0
-            return "req-x", logits
+            logits[0, 0, token_sequence[i]] = 100.0
+            return TensorMessage(request_id="req-x", tensor=logits, finished=False)
 
         coord._first_sender = MagicMock()
         coord._first_sender.send = AsyncMock(side_effect=fake_send)
+        coord._first_sender.send_finished = AsyncMock(side_effect=fake_send_finished)
         coord._logits_receiver = MagicMock()
         coord._logits_receiver.recv = AsyncMock(side_effect=fake_recv)
 

@@ -52,6 +52,8 @@ def parse_args() -> argparse.Namespace:
                    help="This worker holds norm + lm_head")
     p.add_argument("--next-host", default=None,
                    help="Hostname of the next pipeline stage (omit for last worker)")
+    p.add_argument("--next-port", type=int, default=None,
+                   help="Port of the next pipeline stage's PULL socket (omit for last worker)")
     p.add_argument("--coordinator-host", default="127.0.0.1",
                    help="Hostname of the coordinator (needed for last worker)")
     p.add_argument("--coordinator-results-port", type=int, default=29600,
@@ -82,6 +84,7 @@ async def main() -> None:
         shard=shard,
         model_id=args.model,
         next_worker_host=args.next_host,
+        next_worker_port=args.next_port,
         coordinator_host=args.coordinator_host,
         coordinator_results_port=args.coordinator_results_port,
         device=args.device,
@@ -97,15 +100,30 @@ async def main() -> None:
         logger.info("Shutdown signal received")
         stop_event.set()
 
+    # Register OS signal handlers where supported (Unix).
+    # On Windows, loop.add_signal_handler() raises NotImplementedError for most
+    # signals, so we fall back to the stdlib signal module for SIGINT only and
+    # rely on KeyboardInterrupt for interactive Ctrl-C.
+    _using_loop_signals = False
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, _handle_signal)
-        except NotImplementedError:
-            # Windows: signal handlers in asyncio are limited
-            pass
+            _using_loop_signals = True
+        except (NotImplementedError, OSError):
+            pass  # Windows or unsupported signal
 
     run_task = asyncio.create_task(worker.run())
-    await stop_event.wait()
+
+    if _using_loop_signals:
+        await stop_event.wait()
+    else:
+        # Windows fallback: wait for the run task and catch KeyboardInterrupt
+        try:
+            await run_task
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            pass
+        finally:
+            stop_event.set()
 
     run_task.cancel()
     try:

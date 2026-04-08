@@ -146,7 +146,11 @@ class ShardedModel(nn.Module):
         new_kvs: Optional[KVCache] = [] if use_cache else None
 
         for i, layer in enumerate(self.layers):
-            past_kv = past_key_values[i] if past_key_values else None
+            past_kv = (
+                past_key_values[i]
+                if past_key_values is not None and i < len(past_key_values)
+                else None
+            )
             layer_out = layer(
                 hidden_states,
                 past_key_value=past_kv,

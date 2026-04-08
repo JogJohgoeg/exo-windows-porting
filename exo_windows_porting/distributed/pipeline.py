@@ -204,6 +204,7 @@ class DistributedPipelineEngine(LLMBackend):
                 shard=shard,
                 model_id=self.topology.model_id,
                 next_worker_host=next_host,
+                next_worker_port=next_shard.inference_port if next_shard else None,
                 coordinator_host=self.coordinator_host,
                 coordinator_results_port=self.results_port,
                 device=device,

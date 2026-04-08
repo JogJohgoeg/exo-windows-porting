@@ -29,7 +29,7 @@ from typing import AsyncIterator, List, Optional
 import torch
 
 from .shard import ClusterTopology
-from .transport import ActivationSender, LogitsReceiver
+from .transport import ActivationSender, LogitsReceiver, TensorMessage
 
 logger = logging.getLogger(__name__)
 
@@ -148,12 +148,37 @@ class ShardCoordinator:
         generated_ids: List[int] = []
         generated_text = ""
 
+        async def _recv_logits() -> torch.Tensor:
+            """Receive logits and validate they belong to this request."""
+            msg: TensorMessage = await self._logits_receiver.recv()
+            if msg.request_id != request_id:
+                logger.warning(
+                    "request_id mismatch: expected %s, got %s — possible pipeline desync",
+                    request_id, msg.request_id,
+                )
+            return msg.tensor
+
+        async def _evict_kv_cache() -> None:
+            """Send FINISHED signal and drain the echo that cascades back."""
+            await self._first_sender.send_finished(request_id)
+            try:
+                echo: TensorMessage = await self._logits_receiver.recv(timeout_ms=5_000)
+                if not echo.finished:
+                    logger.warning(
+                        "Expected FINISHED echo for %s, got tensor instead", request_id
+                    )
+            except TimeoutError:
+                logger.warning(
+                    "FINISHED echo timed out for request %s — workers may have stale KV cache",
+                    request_id,
+                )
+
         # ── Prefill ───────────────────────────────────────────────────
         # Send full prompt token IDs to first worker
         await self._first_sender.send(request_id, input_ids)
 
         # Receive logits from last worker [1, prompt_len, vocab]
-        _, logits = await self._logits_receiver.recv()
+        logits = await _recv_logits()
 
         # Sample from the last position
         next_token_id = self._sample(logits[:, -1, :])
@@ -164,6 +189,7 @@ class ShardCoordinator:
         yield decoded
 
         if next_token_id == eos_id or _hit_stop(generated_text, stop_sequences):
+            await _evict_kv_cache()
             return
 
         # ── Decode loop ────────────────────────────────────────────────
@@ -172,7 +198,7 @@ class ShardCoordinator:
             new_token_tensor = torch.tensor([[next_token_id]], dtype=torch.long)
             await self._first_sender.send(request_id, new_token_tensor)
 
-            _, logits = await self._logits_receiver.recv()
+            logits = await _recv_logits()
             next_token_id = self._sample(logits[:, -1, :])
             generated_ids.append(next_token_id)
 
@@ -183,6 +209,7 @@ class ShardCoordinator:
             if next_token_id == eos_id or _hit_stop(generated_text, stop_sequences):
                 break
 
+        await _evict_kv_cache()
         logger.info(
             "Request %s finished: %d tokens generated", request_id, len(generated_ids)
         )
