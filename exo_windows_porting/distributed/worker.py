@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Dict, List, Optional
 
 import torch
@@ -90,6 +91,9 @@ class PipelineWorker:
         self._logits_sender: Optional[LogitsSender] = None
 
         self._kv_store: _KVStore = {}
+        self._kv_timestamps: Dict[str, float] = {}   # request_id → last-access wall time
+        self._kv_ttl_seconds: float = 300.0           # evict after 5 min of inactivity
+        self._last_ttl_check: float = 0.0
         self._running = False
 
     # ------------------------------------------------------------------
@@ -148,6 +152,7 @@ class PipelineWorker:
     async def run(self) -> None:
         """Receive → forward → send.  Loops until stop() is called."""
         logger.info("Worker %s entering run loop", self.shard.node_id)
+        self._last_ttl_check = time.monotonic()
         while self._running:
             try:
                 await self._process_one()
@@ -161,6 +166,12 @@ class PipelineWorker:
                 # Brief back-off before retrying, so we don't spin-loop on a
                 # persistent failure (e.g. broken socket on the wrong port).
                 await asyncio.sleep(0.5)
+
+            # Periodically evict KV cache entries for zombie / hung requests.
+            now = time.monotonic()
+            if now - self._last_ttl_check >= 60.0:
+                self._evict_stale_kv()
+                self._last_ttl_check = now
 
     # ------------------------------------------------------------------
     # Single step
@@ -208,6 +219,7 @@ class PipelineWorker:
 
     def _forward(self, request_id: str, activation: torch.Tensor):
         past_kv = self._kv_store.get(request_id)
+        self._kv_timestamps[request_id] = time.monotonic()   # refresh on every use
 
         if self.shard.is_first:
             output, new_kv = self._model(
@@ -228,6 +240,7 @@ class PipelineWorker:
 
     def clear_kv_cache(self, request_id: str) -> None:
         """Release KV tensors for a finished request and free VRAM."""
+        self._kv_timestamps.pop(request_id, None)
         if request_id in self._kv_store:
             del self._kv_store[request_id]
             if self.device.startswith("cuda"):
@@ -235,3 +248,18 @@ class PipelineWorker:
             logger.debug(
                 "Worker %s: KV cache evicted for %s", self.shard.node_id, request_id
             )
+
+    def _evict_stale_kv(self) -> None:
+        """Evict KV cache entries that have not been accessed within the TTL.
+
+        Protects against coordinator crashes that leave workers holding stale
+        KV tensors indefinitely.
+        """
+        cutoff = time.monotonic() - self._kv_ttl_seconds
+        stale = [rid for rid, ts in self._kv_timestamps.items() if ts < cutoff]
+        for rid in stale:
+            logger.warning(
+                "Worker %s: evicting zombie KV cache for %s (idle > %.0fs)",
+                self.shard.node_id, rid, self._kv_ttl_seconds,
+            )
+            self.clear_kv_cache(rid)

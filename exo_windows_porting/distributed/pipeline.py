@@ -36,6 +36,7 @@ from typing import List, Optional
 from ..backend.base import LLMBackend
 from .coordinator import ShardCoordinator
 from .shard import ClusterTopology, ModelShard, assign_shards
+from .transport import close_zmq_context
 from .worker import PipelineWorker
 
 logger = logging.getLogger(__name__)
@@ -240,13 +241,45 @@ class DistributedPipelineEngine(LLMBackend):
                 node_id, exc, exc_info=exc,
             )
 
-    async def stop(self) -> None:
+    async def stop(self, drain_timeout: float = 5.0) -> None:
+        """Stop all local workers and the coordinator.
+
+        Args:
+            drain_timeout: Seconds to wait for in-flight requests to finish
+                           before force-cancelling worker tasks.  Set to 0 to
+                           cancel immediately.
+        """
+        # 1. Tell each worker to stop accepting new messages (sets _running=False).
+        #    The current in-flight _process_one() can still complete.
+        for worker in self._workers:
+            worker._running = False
+
+        # 2. Wait briefly for tasks to drain naturally.
+        if drain_timeout > 0 and self._worker_tasks:
+            done, pending = await asyncio.wait(
+                self._worker_tasks,
+                timeout=drain_timeout,
+                return_when=asyncio.ALL_COMPLETED,
+            )
+            if pending:
+                logger.warning(
+                    "%d worker task(s) did not finish within %.1fs drain window — cancelling",
+                    len(pending), drain_timeout,
+                )
+
+        # 3. Cancel any tasks that are still running.
         for task in self._worker_tasks:
             task.cancel()
         await asyncio.gather(*self._worker_tasks, return_exceptions=True)
+
+        # 4. Clean up sockets and model resources.
         for worker in self._workers:
             await worker.stop()
         await self._coordinator.stop()
+
+        # 5. Release the shared ZMQ context (OS file descriptors).
+        close_zmq_context()
+
         self._started = False
 
     # ------------------------------------------------------------------

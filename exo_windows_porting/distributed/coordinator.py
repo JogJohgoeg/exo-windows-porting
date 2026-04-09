@@ -149,14 +149,33 @@ class ShardCoordinator:
         generated_text = ""
 
         async def _recv_logits() -> torch.Tensor:
-            """Receive logits and validate they belong to this request."""
-            msg: TensorMessage = await self._logits_receiver.recv()
-            if msg.request_id != request_id:
+            """Receive logits that belong to *this* request.
+
+            If a message for a different request_id arrives first (pipeline
+            desync), it is discarded with a warning and we keep waiting.
+            We allow at most _MAX_SKIP mismatches before raising to avoid an
+            infinite loop when the pipeline is completely out of sync.
+            """
+            _MAX_SKIP = 8
+            for _ in range(_MAX_SKIP + 1):
+                msg: TensorMessage = await self._logits_receiver.recv()
+                if msg.finished:
+                    # Should not happen here; swallow and wait for real logits.
+                    logger.warning(
+                        "Unexpected FINISHED message while waiting for logits "
+                        "(request %s) — discarding", request_id,
+                    )
+                    continue
+                if msg.request_id == request_id:
+                    return msg.tensor
                 logger.warning(
-                    "request_id mismatch: expected %s, got %s — possible pipeline desync",
+                    "request_id mismatch: expected %s, got %s — discarding stale message",
                     request_id, msg.request_id,
                 )
-            return msg.tensor
+            raise RuntimeError(
+                f"Pipeline desync: could not receive logits for {request_id} "
+                f"after {_MAX_SKIP} attempts"
+            )
 
         async def _evict_kv_cache() -> None:
             """Send FINISHED signal and drain the echo that cascades back."""

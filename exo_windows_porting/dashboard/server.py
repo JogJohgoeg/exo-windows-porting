@@ -183,9 +183,12 @@ async def process_inference_task(request: InferenceRequest, request_id: str):
                 detail="GPU required but no GPU available on this system"
             )
         
+        # Let the factory auto-select the best available backend.
+        # Only force CPU when the user explicitly requests it via force_cpu field,
+        # not simply because gpu_required is False (user may still want GPU).
         backend = factory.create_backend(
             model_path=request.model_path,
-            force_cpu=(not request.gpu_required)  # Force CPU if GPU not requested
+            force_cpu=False,
         )
         
         # Execute inference

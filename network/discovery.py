@@ -172,6 +172,7 @@ class PeerDiscoveryManager:
         # 事件循环和线程控制
         self.running = False
         self.stop_event = Event()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None  # set in start()
 
         # 回调函数
         self.on_peer_discovered: Optional[Callable[[PeerNodeInfo], Awaitable[None]]] = None
@@ -218,7 +219,9 @@ class PeerDiscoveryManager:
         
         self.running = True
         self.stop_event.clear()
-        
+        # Capture the running loop so the zeroconf thread can schedule callbacks.
+        self._loop = asyncio.get_running_loop()
+
         try:
             # 初始化 zeroconf
             self.zeroconf = Zeroconf()
@@ -307,39 +310,35 @@ class PeerDiscoveryManager:
             logger.error("Error processing discovered service: %s", e)
     
     def _on_peer_lost(self, name: str) -> None:
-        """当节点消失时调用"""
-        
+        """Called by the zeroconf ServiceBrowser thread when a peer disappears.
+
+        This runs in a *non-async* thread, so we must use
+        ``run_coroutine_threadsafe`` to schedule the async callback on the
+        event loop that was captured in ``start()``.
+        """
         try:
-            # 从 peers 列表中移除
             for node_id in list(self.peers.keys()):
                 if name.startswith(f"{node_id}."):
                     del self.peers[node_id]
                     logger.warning("Peer lost: %s", node_id)
-                    
-                    # 触发回调 - 使用安全的异步调用方式
-                    if self.on_peer_lost:
-                        try:
-                            loop = asyncio.get_running_loop()
-                            # 在运行中的事件循环中调度任务
-                            asyncio.create_task(self.on_peer_lost(node_id))
-                        except RuntimeError:
-                            # 没有运行中的事件循环，使用 create_task 或同步处理
-                            import threading
-                            threading.Thread(
-                                target=lambda: self._run_callback_async(node_id),
-                                daemon=True
-                            ).start()
-                        
-        except Exception as e:
-            logger.error("Error processing lost service: %s", e)
-    
-    async def _run_callback_async(self, node_id: str) -> None:
-        """在后台线程中安全运行异步回调"""
-        
-        try:
-            await self.on_peer_lost(node_id)
-        except Exception as e:
-            logger.error("Error in peer lost callback for %s: %s", node_id, e)
+
+                    if self.on_peer_lost and self._loop is not None:
+                        future = asyncio.run_coroutine_threadsafe(
+                            self.on_peer_lost(node_id), self._loop
+                        )
+                        # Log errors without blocking the zeroconf thread.
+                        future.add_done_callback(
+                            lambda f, nid=node_id: (
+                                logger.error(
+                                    "peer_lost callback for %s raised: %s", nid, f.exception()
+                                )
+                                if not f.cancelled() and f.exception()
+                                else None
+                            )
+                        )
+
+        except Exception as exc:
+            logger.error("Error processing lost service: %s", exc)
     
     async def discover_peers(self, timeout: float = 5.0) -> List[PeerNodeInfo]:
         """

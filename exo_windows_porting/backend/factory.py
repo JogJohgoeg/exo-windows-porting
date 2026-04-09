@@ -262,6 +262,7 @@ class BackendFactory:
                     model_path=model_path,
                     device_id=0,
                     n_ctx=self.config.n_ctx,
+                    verbose=self.config.verbose,
                 )
             except ImportError:
                 logger.warning(
@@ -276,6 +277,7 @@ class BackendFactory:
                     model_path=model_path,
                     device_id=0,
                     n_ctx=self.config.n_ctx,
+                    verbose=self.config.verbose,
                 )
             except ImportError:
                 logger.warning(
@@ -350,8 +352,6 @@ def detect_hardware() -> HardwareDetector:
 
 
 def get_available_backends() -> Dict[str, bool]:
-    """Get list of available backends."""
-    if _factory_instance is None:
-        BackendFactory()  # Initialize singleton
-    
+    """Get list of available backends (initialises singleton if needed)."""
+    get_backend_factory()   # ensures _factory_instance is set and backends registered
     return BackendRegistry.list_backends()

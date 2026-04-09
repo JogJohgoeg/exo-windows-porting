@@ -26,10 +26,11 @@ logger = logging.getLogger(__name__)
 class LLamaRocmBackend(LLMBackend):
     """llama.cpp ROCm backend wrapper."""
 
-    def __init__(self, model_path: str, device_id: int = 0, n_ctx: int = 8192):
+    def __init__(self, model_path: str, device_id: int = 0, n_ctx: int = 8192, verbose: bool = False):
         self.model_path = model_path
         self.device_id = device_id
         self.n_ctx = n_ctx
+        self.verbose = verbose
 
         # ROCm is selected by the GPU-targeted wheel; set the device via env var.
         os.environ.setdefault("HIP_VISIBLE_DEVICES", str(device_id))
@@ -41,7 +42,7 @@ class LLamaRocmBackend(LLMBackend):
                 model_path=model_path,
                 n_gpu_layers=-1,  # offload all layers to GPU
                 n_ctx=n_ctx,
-                verbose=False,
+                verbose=verbose,
             )
 
             logger.info("ROCm backend initialized (device=%d, model=%s)", device_id, model_path)

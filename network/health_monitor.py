@@ -280,28 +280,31 @@ class HealthMonitor:
 # Health check utility functions
 async def ping_node(host: str, port: int, timeout: float = 5.0) -> bool:
     """
-    Check if a node is reachable via TCP ping.
-    
+    Check if a node is reachable via async TCP ping.
+
+    Uses asyncio.open_connection() so the event loop is never blocked.
+
     Args:
         host: Node hostname or IP address
         port: Node port number
         timeout: Connection timeout in seconds
-        
+
     Returns:
         True if node is reachable, False otherwise
     """
-    
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(timeout)
-        
-        result = sock.connect_ex((host, port))
-        sock.close()
-        
-        return result == 0
-        
-    except Exception as e:
-        logger.debug("Ping failed to %s:%d: %s", host, port, e)
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port),
+            timeout=timeout,
+        )
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return True
+    except Exception as exc:
+        logger.debug("Ping failed to %s:%d: %s", host, port, exc)
         return False
 
 

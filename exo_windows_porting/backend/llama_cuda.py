@@ -19,10 +19,11 @@ logger = logging.getLogger(__name__)
 class LLamaCudaBackend(LLMBackend):
     """llama.cpp CUDA backend wrapper."""
 
-    def __init__(self, model_path: str, device_id: int = 0, n_ctx: int = 8192):
+    def __init__(self, model_path: str, device_id: int = 0, n_ctx: int = 8192, verbose: bool = False):
         self.model_path = model_path
         self.device_id = device_id
         self.n_ctx = n_ctx
+        self.verbose = verbose
 
         os.environ.setdefault("CUDA_VISIBLE_DEVICES", str(device_id))
 
@@ -33,7 +34,7 @@ class LLamaCudaBackend(LLMBackend):
                 model_path=model_path,
                 n_gpu_layers=-1,
                 n_ctx=n_ctx,
-                verbose=False,
+                verbose=verbose,
             )
 
             logger.info("CUDA backend initialized (device=%d, model=%s)", device_id, model_path)

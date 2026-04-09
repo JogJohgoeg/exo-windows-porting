@@ -496,11 +496,15 @@ class TestMockGeneration:
         # Mock transport: pretend 3 tokens are returned then EOS
         token_sequence = [42, 17, 2]   # last is EOS
         call_count = {"n": 0}
+        # Capture the actual request_id that the coordinator uses so recv()
+        # can echo it back — _recv_logits() now validates IDs strictly.
+        captured_rid: list = []
 
         from exo_windows_porting.distributed.transport import TensorMessage
 
         async def fake_send(rid, tensor):
-            pass
+            if not captured_rid:
+                captured_rid.append(rid)
 
         async def fake_send_finished(rid):
             pass
@@ -508,13 +512,14 @@ class TestMockGeneration:
         async def fake_recv(timeout_ms=30_000):
             i = call_count["n"]
             call_count["n"] += 1
+            rid = captured_rid[0] if captured_rid else "req-x"
             # After generation tokens, return a FINISHED echo when asked
             if i >= len(token_sequence):
-                return TensorMessage(request_id="req-x", tensor=None, finished=True)
+                return TensorMessage(request_id=rid, tensor=None, finished=True)
             # Return dummy logits with the desired token as argmax
             logits = torch.full((1, 1, 100), -100.0)
             logits[0, 0, token_sequence[i]] = 100.0
-            return TensorMessage(request_id="req-x", tensor=logits, finished=False)
+            return TensorMessage(request_id=rid, tensor=logits, finished=False)
 
         coord._first_sender = MagicMock()
         coord._first_sender.send = AsyncMock(side_effect=fake_send)

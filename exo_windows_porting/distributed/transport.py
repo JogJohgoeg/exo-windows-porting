@@ -38,6 +38,23 @@ import zmq.asyncio
 logger = logging.getLogger(__name__)
 
 _MAGIC = 0xE7E0DA7A
+
+
+def close_zmq_context() -> None:
+    """
+    Terminate the shared ZMQ async context.
+
+    Call this exactly once during process shutdown — after all sockets have
+    been closed — to release OS file descriptors held by the ZMQ context.
+    Safe to call multiple times (subsequent calls are no-ops).
+    """
+    try:
+        ctx = zmq.asyncio.Context.instance()
+        if not ctx.closed:
+            ctx.term()
+            logger.debug("ZMQ context terminated")
+    except Exception as exc:  # pragma: no cover
+        logger.debug("ZMQ context term error (ignored): %s", exc)
 _FLAG_FINISHED = 0x01
 
 _DTYPE_MAP: dict = {
