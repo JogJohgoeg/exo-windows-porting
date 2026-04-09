@@ -135,5 +135,14 @@ async def main() -> None:
     logger.info("Worker %s stopped cleanly.", args.node_id)
 
 
-if __name__ == "__main__":
+def run() -> None:
+    """Synchronous entry point for the ``exo-worker`` console script.
+
+    Console scripts installed by pip call a plain function — they cannot call
+    an async coroutine directly.  This wrapper bridges the gap.
+    """
     asyncio.run(main())
+
+
+if __name__ == "__main__":
+    run()

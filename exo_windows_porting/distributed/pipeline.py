@@ -212,9 +212,14 @@ class DistributedPipelineEngine(LLMBackend):
             await worker.start()
             self._workers.append(worker)
 
-            # Run the worker event loop in a background asyncio task
+            # Run the worker event loop in a background asyncio task.
+            # The done-callback surfaces exceptions immediately rather than
+            # letting them sit silently until stop() is called.
             task = asyncio.create_task(
                 worker.run(), name=f"worker-{shard.node_id}"
+            )
+            task.add_done_callback(
+                lambda t, nid=shard.node_id: self._on_worker_done(t, nid)
             )
             self._worker_tasks.append(task)
 
@@ -222,6 +227,18 @@ class DistributedPipelineEngine(LLMBackend):
         await self._coordinator.start()
         self._started = True
         logger.info("DistributedPipelineEngine started (%d local shard(s))", len(self._workers))
+
+    def _on_worker_done(self, task: asyncio.Task, node_id: str) -> None:
+        """Called when a worker task finishes (normally, cancelled, or with error)."""
+        if task.cancelled():
+            logger.debug("Worker %s task cancelled", node_id)
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(
+                "Worker %s crashed — pipeline may be stalled: %s",
+                node_id, exc, exc_info=exc,
+            )
 
     async def stop(self) -> None:
         for task in self._worker_tasks:

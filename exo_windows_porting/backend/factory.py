@@ -168,16 +168,22 @@ class BackendFactory:
         self.config = config or BackendConfig()
         self.hardware = HardwareDetector()
         
-        # Initialize registry if not already done (lazy import to avoid circular deps)
-        # Backend classes are imported lazily in create_backend method
-        
-        # Register backends that we know exist
-        from .llama_rocm import LLamaRocmBackend
-        from .llama_cuda import LLamaCudaBackend
+        # Register backends with safe imports so a missing wheel (e.g. ROCm
+        # not installed) doesn't crash factory construction.
+        try:
+            from .llama_rocm import LLamaRocmBackend
+            BackendRegistry.register("rocm", LLamaRocmBackend)
+        except ImportError as exc:
+            logger.debug("ROCm backend unavailable: %s", exc)
+
+        try:
+            from .llama_cuda import LLamaCudaBackend
+            BackendRegistry.register("cuda", LLamaCudaBackend)
+        except ImportError as exc:
+            logger.debug("CUDA backend unavailable: %s", exc)
+
+        # CPU backend is always required — let any ImportError propagate.
         from .llama_cpu import LLamaCpuBackend
-        
-        BackendRegistry.register("rocm", LLamaRocmBackend)
-        BackendRegistry.register("cuda", LLamaCudaBackend)
         BackendRegistry.register("cpu", LLamaCpuBackend)
     
     def select_backend(self) -> str:
@@ -248,33 +254,42 @@ class BackendFactory:
             )
         
         selected = self.select_backend()
-        
+
         if selected == "rocm":
-            from .llama_rocm import LLamaRocmBackend
-            
-            return LLamaRocmBackend(
-                model_path=model_path,
-                device_id=0,
-                n_ctx=self.config.n_ctx
-            )
-        
-        elif selected == "cuda":
-            from .llama_cuda import LLamaCudaBackend
-            
-            return LLamaCudaBackend(
-                model_path=model_path,
-                device_id=0,
-                n_ctx=self.config.n_ctx
-            )
-        
-        else:  # cpu fallback
-            from .llama_cpu import LLamaCpuBackend
-            
-            return LLamaCpuBackend(
-                model_path=model_path,
-                n_ctx=self.config.n_ctx,
-                verbose=self.config.verbose
-            )
+            try:
+                from .llama_rocm import LLamaRocmBackend
+                return LLamaRocmBackend(
+                    model_path=model_path,
+                    device_id=0,
+                    n_ctx=self.config.n_ctx,
+                )
+            except ImportError:
+                logger.warning(
+                    "ROCm backend selected but wheel not installed — falling back to CPU"
+                )
+                selected = "cpu"
+
+        if selected == "cuda":
+            try:
+                from .llama_cuda import LLamaCudaBackend
+                return LLamaCudaBackend(
+                    model_path=model_path,
+                    device_id=0,
+                    n_ctx=self.config.n_ctx,
+                )
+            except ImportError:
+                logger.warning(
+                    "CUDA backend selected but wheel not installed — falling back to CPU"
+                )
+                selected = "cpu"
+
+        # CPU fallback (also the explicit "cpu" path)
+        from .llama_cpu import LLamaCpuBackend
+        return LLamaCpuBackend(
+            model_path=model_path,
+            n_ctx=self.config.n_ctx,
+            verbose=self.config.verbose,
+        )
     
     def get_backend_info(self) -> Dict[str, Any]:
         """Get information about available backends."""

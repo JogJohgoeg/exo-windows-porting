@@ -77,6 +77,11 @@ def _serialize(
 
     dtype_char = _TORCH_TO_CHAR.get(tensor.dtype)
     if dtype_char is None:
+        logger.warning(
+            "Unsupported tensor dtype %s — converting to float16 for transport. "
+            "This may cause numerical differences from single-node inference.",
+            tensor.dtype,
+        )
         tensor = tensor.to(torch.float16)
         dtype_char = "h"
 
@@ -175,6 +180,12 @@ class ActivationReceiver:
     def __init__(self, port: int, host: str = "*"):
         self._ctx = zmq.asyncio.Context.instance()
         self._sock = self._ctx.socket(zmq.PULL)
+        # Allow quick restart without waiting for TIME_WAIT to expire.
+        self._sock.setsockopt(zmq.RCVTIMEO, -1)
+        try:
+            self._sock.setsockopt(zmq.IPV6, 0)
+        except zmq.ZMQError:
+            pass
         self._sock.bind(f"tcp://{host}:{port}")
         logger.info("ActivationReceiver bound on port %d", port)
 
@@ -223,6 +234,7 @@ class LogitsReceiver:
     def __init__(self, results_port: int):
         self._ctx = zmq.asyncio.Context.instance()
         self._sock = self._ctx.socket(zmq.PULL)
+        self._sock.setsockopt(zmq.RCVTIMEO, -1)
         self._sock.bind(f"tcp://*:{results_port}")
         logger.info("LogitsReceiver bound on port %d", results_port)
 

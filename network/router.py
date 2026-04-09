@@ -252,6 +252,52 @@ class SimpleRouter:
             hash_value = int(hashlib.md5(node_id.encode()).hexdigest(), 16)
             return (hash_value % 1000) / 1000.0  # Return value between 0 and 1
 
+    def select_node(self, nodes, requirements: dict):
+        """
+        Simplified routing interface used by the discovery/health stack.
+
+        Args:
+            nodes: List of node dicts or PeerNodeInfo objects.
+            requirements: Dict with optional keys ``gpu_required`` (bool) and
+                          ``min_gpu_memory_mb`` (int).
+
+        Returns:
+            The selected node (same type as input elements) or ``None`` if no
+            node satisfies the requirements.
+        """
+        if not nodes:
+            return None
+
+        # Normalise PeerNodeInfo objects to dicts so _filter_nodes can work.
+        def _to_dict(n):
+            if isinstance(n, dict):
+                return n
+            try:
+                from dataclasses import asdict as _asdict
+                return _asdict(n)
+            except Exception:
+                return vars(n)
+
+        node_dicts = [_to_dict(n) for n in nodes]
+
+        task = TaskRequest(
+            task_id="__select_node__",
+            model_path="",
+            prompt="",
+            gpu_required=requirements.get("gpu_required", False),
+            min_gpu_memory_mb=requirements.get("min_gpu_memory_mb", 0),
+        )
+
+        result = self.route(task, node_dicts)
+        if result.selected_node_id is None:
+            return None
+
+        # Return the original node object (not the normalised dict copy).
+        for original, d in zip(nodes, node_dicts):
+            if d.get("node_id") == result.selected_node_id:
+                return original
+        return None
+
 
 class LoadBalancer:
     """

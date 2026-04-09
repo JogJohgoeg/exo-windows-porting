@@ -100,7 +100,7 @@ class PipelineWorker:
         """Load model shard and bind network sockets."""
         logger.info("Starting worker %s (device=%s)", self.shard, self.device)
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         # Load model in thread so we don't block the event loop
         self._model = await loop.run_in_executor(
@@ -189,7 +189,7 @@ class PipelineWorker:
         request_id = msg.request_id
         activation = msg.tensor
 
-        output, new_kv = await asyncio.get_event_loop().run_in_executor(
+        output, new_kv = await asyncio.get_running_loop().run_in_executor(
             None, lambda: self._forward(request_id, activation)
         )
 

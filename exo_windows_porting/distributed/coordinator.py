@@ -232,16 +232,21 @@ class ShardCoordinator:
 
         logits = logits / self.temperature
 
-        # Top-p filtering
+        # Top-p (nucleus) filtering
         if self.top_p < 1.0:
             sorted_logits, sorted_indices = torch.sort(logits, descending=True)
             cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
 
-            # Remove tokens with cumulative prob above the threshold
+            # Mark tokens whose *preceding* cumulative mass already exceeds top_p.
+            # Shift right by one so we always include the token that first pushes
+            # cumulative probability over the threshold (the "bridge token").
             sorted_indices_to_remove = cumulative_probs - torch.softmax(sorted_logits, dim=-1) > self.top_p
+            sorted_indices_to_remove[1:] = sorted_indices_to_remove[:-1].clone()
+            sorted_indices_to_remove[0] = False   # top token is always kept
+
             sorted_logits[sorted_indices_to_remove] = float("-inf")
 
-            # Scatter back
+            # Scatter back to original token order
             logits = torch.zeros_like(logits).scatter_(0, sorted_indices, sorted_logits)
 
         probs = torch.softmax(logits, dim=-1)
