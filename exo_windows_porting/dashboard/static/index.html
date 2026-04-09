@@ -359,7 +359,7 @@ async function refreshStatus() {
   }
 
   try {
-    const r = await fetch(`${BASE}/v1/cluster/status`);
+    const r = await fetch(`${BASE}/v1/cluster/status`, { headers: getHeaders() });
     if (r.ok) {
       const d = await r.json();
       document.getElementById('active-nodes').textContent = d.active_nodes ?? '—';
@@ -370,7 +370,7 @@ async function refreshStatus() {
   } catch {}
 
   try {
-    const r = await fetch(`${BASE}/v1/health/backends`);
+    const r = await fetch(`${BASE}/v1/health/backends`, { headers: getHeaders() });
     if (r.ok) {
       const d = await r.json();
       const sel = d.selected_backend || '';

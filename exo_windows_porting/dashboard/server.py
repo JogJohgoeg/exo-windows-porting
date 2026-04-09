@@ -14,6 +14,7 @@ import logging
 import os
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
@@ -95,12 +96,22 @@ class ClusterStatus(BaseModel):
 # FastAPI Application
 # ---------------------------------------------------------------------------
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _server_start_time
+    _server_start_time = time.time()
+    logger.info("Exo Windows Porting API started")
+    yield
+    logger.info("Exo Windows Porting API stopped")
+
+
 app = FastAPI(
     title="Exo Windows Porting API",
     description="REST API for distributed LLM inference on Windows with ROCm/CUDA support",
     version="0.1.0",
     docs_url="/docs",
     redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -425,18 +436,3 @@ async def check_backends():
     }
 
 
-# ---------------------------------------------------------------------------
-# Lifecycle events
-# ---------------------------------------------------------------------------
-
-
-@app.on_event("startup")
-async def startup_event():
-    global _server_start_time
-    _server_start_time = time.time()
-    logger.info("Exo Windows Porting API started")
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    logger.info("Exo Windows Porting API stopped")

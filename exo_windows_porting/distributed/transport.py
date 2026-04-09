@@ -55,6 +55,8 @@ def close_zmq_context() -> None:
             logger.debug("ZMQ context terminated")
     except Exception as exc:  # pragma: no cover
         logger.debug("ZMQ context term error (ignored): %s", exc)
+
+
 _FLAG_FINISHED = 0x01
 
 _DTYPE_MAP: dict = {
@@ -134,11 +136,18 @@ def _deserialize(data: bytes) -> TensorMessage:
     shape = struct.unpack_from(f"!{ndim}q", data, offset)
     offset += 8 * ndim
 
-    torch_dtype = _DTYPE_MAP.get(dtype_char, torch.float16)
-    np_dtype = {
+    _NP_DTYPE_MAP: dict = {
         "f": np.float32, "h": np.float16,
         "l": np.int64,   "i": np.int32,
-    }[dtype_char]
+    }
+    torch_dtype = _DTYPE_MAP.get(dtype_char, torch.float16)
+    np_dtype = _NP_DTYPE_MAP.get(dtype_char)
+    if np_dtype is None:
+        logger.warning(
+            "Unknown dtype char %r in received tensor — falling back to float16", dtype_char
+        )
+        torch_dtype = torch.float16
+        np_dtype = np.float16
 
     arr = np.frombuffer(data[offset:], dtype=np_dtype).reshape(shape)
     tensor = torch.from_numpy(arr.copy()).to(torch_dtype)
