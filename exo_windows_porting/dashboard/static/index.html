@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Exo Windows Porting — Dashboard</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #0f1117;
+    color: #e2e8f0;
+    min-height: 100vh;
+  }
+
+  header {
+    background: #1a1d2e;
+    border-bottom: 1px solid #2d3748;
+    padding: 1rem 2rem;
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+  }
+
+  header h1 { font-size: 1.25rem; font-weight: 600; color: #7c3aed; }
+  header .version { font-size: 0.75rem; color: #718096; margin-top: 2px; }
+
+  .badge {
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .badge-ok  { background: #065f46; color: #6ee7b7; }
+  .badge-err { background: #7f1d1d; color: #fca5a5; }
+  .badge-gpu { background: #1e3a5f; color: #93c5fd; }
+  .badge-cpu { background: #3b1c5c; color: #c4b5fd; }
+
+  main {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 2rem;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1.5rem;
+  }
+
+  @media (max-width: 768px) {
+    main { grid-template-columns: 1fr; padding: 1rem; }
+  }
+
+  .card {
+    background: #1a1d2e;
+    border: 1px solid #2d3748;
+    border-radius: 12px;
+    padding: 1.5rem;
+  }
+
+  .card h2 {
+    font-size: 0.85rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #718096;
+    margin-bottom: 1rem;
+  }
+
+  .stat-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.75rem;
+  }
+
+  .stat {
+    background: #0f1117;
+    border-radius: 8px;
+    padding: 0.75rem;
+  }
+  .stat-label { font-size: 0.7rem; color: #718096; }
+  .stat-value { font-size: 1.4rem; font-weight: 700; color: #e2e8f0; margin-top: 2px; }
+
+  .backend-list { display: flex; flex-direction: column; gap: 0.5rem; }
+  .backend-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: #0f1117;
+    border-radius: 8px;
+    padding: 0.6rem 0.75rem;
+    font-size: 0.85rem;
+  }
+  .backend-name { text-transform: uppercase; font-weight: 600; letter-spacing: 0.05em; }
+  .selected-indicator {
+    font-size: 0.7rem;
+    color: #a78bfa;
+    background: #2e1065;
+    padding: 2px 6px;
+    border-radius: 4px;
+  }
+
+  .inference-card { grid-column: 1 / -1; }
+
+  label {
+    display: block;
+    font-size: 0.8rem;
+    color: #a0aec0;
+    margin-bottom: 0.4rem;
+  }
+
+  .form-row { margin-bottom: 1rem; }
+
+  .form-inline {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 0.75rem;
+    margin-bottom: 1rem;
+  }
+
+  input[type="text"], input[type="number"], input[type="password"], textarea, select {
+    width: 100%;
+    background: #0f1117;
+    border: 1px solid #2d3748;
+    border-radius: 8px;
+    color: #e2e8f0;
+    padding: 0.6rem 0.75rem;
+    font-size: 0.9rem;
+    font-family: inherit;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  input:focus, textarea:focus, select:focus { border-color: #7c3aed; }
+
+  textarea { resize: vertical; min-height: 100px; }
+
+  .output-area {
+    background: #0a0c14;
+    border: 1px solid #2d3748;
+    border-radius: 8px;
+    padding: 1rem;
+    min-height: 120px;
+    max-height: 400px;
+    overflow-y: auto;
+    font-family: "Cascadia Code", "Fira Code", monospace;
+    font-size: 0.85rem;
+    color: #a5f3fc;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .output-placeholder { color: #4a5568; font-style: italic; }
+
+  button {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.6rem 1.25rem;
+    border: none;
+    border-radius: 8px;
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity 0.15s, transform 0.1s;
+  }
+  button:active { transform: scale(0.97); }
+
+  .btn-primary { background: #7c3aed; color: #fff; }
+  .btn-primary:hover { opacity: 0.9; }
+  .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .btn-secondary { background: #2d3748; color: #e2e8f0; }
+  .btn-secondary:hover { background: #374151; }
+
+  .button-row { display: flex; gap: 0.75rem; align-items: center; margin-top: 1rem; }
+
+  .status-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    display: inline-block; margin-right: 6px;
+  }
+  .dot-green { background: #10b981; }
+  .dot-red   { background: #ef4444; }
+  .dot-pulse { animation: pulse 1.5s ease-in-out infinite; }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50%       { opacity: 0.3; }
+  }
+
+  .metrics-bar {
+    display: flex;
+    gap: 1rem;
+    font-size: 0.75rem;
+    color: #718096;
+    margin-top: 0.75rem;
+    padding-top: 0.75rem;
+    border-top: 1px solid #2d3748;
+  }
+  .metrics-bar span { color: #e2e8f0; }
+
+  .auth-row {
+    display: flex;
+    align-items: flex-end;
+    gap: 0.75rem;
+    margin-bottom: 1rem;
+  }
+  .auth-row > div { flex: 1; }
+
+  #api-key-status { font-size: 0.75rem; color: #718096; }
+
+  .error-text { color: #fca5a5; font-size: 0.8rem; margin-top: 0.4rem; }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>Exo Windows Porting</h1>
+    <div class="version">Distributed LLM Inference</div>
+  </div>
+  <div id="health-badge" class="badge">...</div>
+</header>
+
+<main>
+
+  <!-- Cluster Status -->
+  <div class="card">
+    <h2>Cluster Status</h2>
+    <div class="stat-grid">
+      <div class="stat">
+        <div class="stat-label">Active Nodes</div>
+        <div class="stat-value" id="active-nodes">—</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Total Nodes</div>
+        <div class="stat-value" id="total-nodes">—</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">GPU Memory (GB)</div>
+        <div class="stat-value" id="gpu-memory">—</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Avg Load (%)</div>
+        <div class="stat-value" id="avg-load">—</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Backend Info -->
+  <div class="card">
+    <h2>Backends</h2>
+    <div class="backend-list" id="backend-list">
+      <div class="output-placeholder">Loading...</div>
+    </div>
+    <div style="margin-top:0.75rem; font-size:0.8rem; color:#718096;">
+      Selected: <span id="selected-backend" style="color:#a78bfa;">—</span>
+    </div>
+  </div>
+
+  <!-- Inference -->
+  <div class="card inference-card">
+    <h2>Inference</h2>
+
+    <div class="auth-row">
+      <div>
+        <label for="api-key-input">API Key (leave blank if not configured)</label>
+        <input type="password" id="api-key-input" placeholder="sk-...">
+      </div>
+      <span id="api-key-status"></span>
+    </div>
+
+    <div class="form-row">
+      <label for="model-path">Model Path</label>
+      <input type="text" id="model-path" placeholder="models/Qwen2.5-7B-Instruct.Q4_K_M.gguf">
+    </div>
+
+    <div class="form-row">
+      <label for="prompt-input">Prompt</label>
+      <textarea id="prompt-input" placeholder="Enter your prompt here..."></textarea>
+    </div>
+
+    <div class="form-inline">
+      <div>
+        <label for="max-tokens">Max Tokens</label>
+        <input type="number" id="max-tokens" value="256" min="1" max="8192">
+      </div>
+      <div>
+        <label for="temperature">Temperature</label>
+        <input type="number" id="temperature" value="0.7" min="0" max="2" step="0.05">
+      </div>
+      <div>
+        <label for="top-p">Top-p</label>
+        <input type="number" id="top-p" value="0.9" min="0" max="1" step="0.05">
+      </div>
+    </div>
+
+    <div style="display:flex; gap:0.75rem; align-items:center; margin-bottom:0.5rem;">
+      <label style="margin:0; display:flex; align-items:center; gap:0.4rem; cursor:pointer;">
+        <input type="checkbox" id="use-stream" checked>
+        <span style="font-size:0.85rem; color:#a0aec0;">Streaming (SSE)</span>
+      </label>
+      <label style="margin:0; display:flex; align-items:center; gap:0.4rem; cursor:pointer;">
+        <input type="checkbox" id="gpu-required">
+        <span style="font-size:0.85rem; color:#a0aec0;">Require GPU</span>
+      </label>
+    </div>
+
+    <div class="form-row">
+      <label>Output</label>
+      <div class="output-area" id="output-area">
+        <span class="output-placeholder">Output will appear here...</span>
+      </div>
+    </div>
+
+    <div id="error-msg" class="error-text" style="display:none;"></div>
+
+    <div class="button-row">
+      <button class="btn-primary" id="run-btn" onclick="runInference()">
+        ▶ Run
+      </button>
+      <button class="btn-secondary" onclick="clearOutput()">Clear</button>
+      <div class="metrics-bar" id="metrics" style="display:none;">
+        Time: <span id="m-time">—</span> ms &nbsp;|&nbsp;
+        Tokens: <span id="m-tokens">—</span> &nbsp;|&nbsp;
+        Speed: <span id="m-speed">—</span> tok/s
+      </div>
+    </div>
+  </div>
+
+</main>
+
+<script>
+const BASE = window.location.origin;
+
+function getHeaders() {
+  const key = document.getElementById('api-key-input').value.trim();
+  const h = { 'Content-Type': 'application/json' };
+  if (key) h['X-API-Key'] = key;
+  return h;
+}
+
+// ── Health & Status polling ──────────────────────────────────────────────────
+
+async function refreshStatus() {
+  try {
+    const r = await fetch(`${BASE}/health`);
+    const badge = document.getElementById('health-badge');
+    if (r.ok) {
+      badge.textContent = 'Healthy';
+      badge.className = 'badge badge-ok';
+    } else {
+      badge.textContent = 'Error';
+      badge.className = 'badge badge-err';
+    }
+  } catch {
+    document.getElementById('health-badge').textContent = 'Offline';
+    document.getElementById('health-badge').className = 'badge badge-err';
+  }
+
+  try {
+    const r = await fetch(`${BASE}/v1/cluster/status`);
+    if (r.ok) {
+      const d = await r.json();
+      document.getElementById('active-nodes').textContent = d.active_nodes ?? '—';
+      document.getElementById('total-nodes').textContent  = d.total_nodes  ?? '—';
+      document.getElementById('gpu-memory').textContent  = (d.total_gpu_memory_gb ?? 0).toFixed(1);
+      document.getElementById('avg-load').textContent    = (d.average_load_percent ?? 0).toFixed(1);
+    }
+  } catch {}
+
+  try {
+    const r = await fetch(`${BASE}/v1/health/backends`);
+    if (r.ok) {
+      const d = await r.json();
+      const sel = d.selected_backend || '';
+      document.getElementById('selected-backend').textContent = sel || '—';
+
+      const list = document.getElementById('backend-list');
+      list.innerHTML = '';
+      const avail = d.available_backends || {};
+      for (const [name, ok] of Object.entries(avail)) {
+        const item = document.createElement('div');
+        item.className = 'backend-item';
+
+        const nameEl = document.createElement('span');
+        nameEl.className = 'backend-name';
+        const dot = `<span class="status-dot ${ok ? 'dot-green' : 'dot-red'}"></span>`;
+        nameEl.innerHTML = dot + name;
+
+        const rightEl = document.createElement('span');
+        if (name === sel) {
+          rightEl.innerHTML = '<span class="selected-indicator">selected</span>';
+        } else {
+          const badge = name === 'cpu' ? 'badge-cpu' : 'badge-gpu';
+          rightEl.innerHTML = `<span class="badge ${badge}">${ok ? 'available' : 'unavailable'}</span>`;
+        }
+
+        item.appendChild(nameEl);
+        item.appendChild(rightEl);
+        list.appendChild(item);
+      }
+      if (list.innerHTML === '') list.innerHTML = '<div class="output-placeholder">No backends registered.</div>';
+    }
+  } catch {}
+}
+
+// ── Inference ────────────────────────────────────────────────────────────────
+
+function setOutput(text, placeholder) {
+  const el = document.getElementById('output-area');
+  if (placeholder) {
+    el.innerHTML = `<span class="output-placeholder">${text}</span>`;
+  } else {
+    el.textContent = text;
+  }
+}
+
+function appendOutput(text) {
+  const el = document.getElementById('output-area');
+  // Remove placeholder on first token
+  if (el.querySelector('.output-placeholder')) el.textContent = '';
+  el.textContent += text;
+  el.scrollTop = el.scrollHeight;
+}
+
+function clearOutput() {
+  setOutput('Output will appear here...', true);
+  document.getElementById('metrics').style.display = 'none';
+  document.getElementById('error-msg').style.display = 'none';
+}
+
+function showError(msg) {
+  const el = document.getElementById('error-msg');
+  el.textContent = msg;
+  el.style.display = 'block';
+}
+
+async function runInference() {
+  const prompt = document.getElementById('prompt-input').value.trim();
+  if (!prompt) { showError('Please enter a prompt.'); return; }
+
+  const modelPath  = document.getElementById('model-path').value.trim();
+  const maxTokens  = parseInt(document.getElementById('max-tokens').value, 10) || 256;
+  const temperature = parseFloat(document.getElementById('temperature').value) || 0.7;
+  const topP       = parseFloat(document.getElementById('top-p').value) || 0.9;
+  const useStream  = document.getElementById('use-stream').checked;
+  const gpuReq     = document.getElementById('gpu-required').checked;
+
+  document.getElementById('error-msg').style.display = 'none';
+  document.getElementById('metrics').style.display = 'none';
+  setOutput('', false);
+
+  const btn = document.getElementById('run-btn');
+  btn.disabled = true;
+  btn.textContent = '⏳ Running…';
+
+  const body = {
+    prompt,
+    model_path: modelPath || null,
+    max_tokens: maxTokens,
+    temperature,
+    top_p: topP,
+    gpu_required: gpuReq,
+    stop_sequences: [],
+  };
+
+  const t0 = performance.now();
+
+  if (useStream) {
+    await runStream(body, t0);
+  } else {
+    await runBatch(body, t0);
+  }
+
+  btn.disabled = false;
+  btn.textContent = '▶ Run';
+}
+
+async function runStream(body, t0) {
+  let tokenCount = 0;
+
+  try {
+    const resp = await fetch(`${BASE}/v1/completions/stream`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify(body),
+    });
+
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+      showError(`Error ${resp.status}: ${err.detail || JSON.stringify(err)}`);
+      return;
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+
+      // Parse SSE lines
+      const lines = buf.split('\n');
+      buf = lines.pop();   // keep incomplete last line
+
+      for (const line of lines) {
+        if (line.startsWith('data: ')) {
+          const data = line.slice(6).trim();
+          if (data === '[DONE]') break;
+          try {
+            const obj = JSON.parse(data);
+            if (obj.token) {
+              appendOutput(obj.token);
+              tokenCount++;
+            } else if (obj.error) {
+              showError(obj.error);
+            }
+          } catch {}
+        }
+      }
+    }
+  } catch (e) {
+    showError(`Request failed: ${e.message}`);
+    return;
+  }
+
+  const elapsed = performance.now() - t0;
+  document.getElementById('m-time').textContent = elapsed.toFixed(0);
+  document.getElementById('m-tokens').textContent = tokenCount;
+  document.getElementById('m-speed').textContent = (tokenCount / (elapsed / 1000)).toFixed(1);
+  document.getElementById('metrics').style.display = 'flex';
+}
+
+async function runBatch(body, t0) {
+  try {
+    const resp = await fetch(`${BASE}/v1/inference`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify(body),
+    });
+
+    const data = await resp.json();
+
+    if (!resp.ok) {
+      showError(`Error ${resp.status}: ${data.detail || JSON.stringify(data)}`);
+      return;
+    }
+
+    if (!data.success) {
+      showError(data.error_message || 'Inference failed');
+      return;
+    }
+
+    setOutput(data.text || '(empty response)', false);
+
+    document.getElementById('m-time').textContent   = (data.time_ms || 0).toFixed(0);
+    document.getElementById('m-tokens').textContent = data.tokens_generated || 0;
+    document.getElementById('m-speed').textContent  = (data.throughput_tok_s || 0).toFixed(1);
+    document.getElementById('metrics').style.display = 'flex';
+
+  } catch (e) {
+    showError(`Request failed: ${e.message}`);
+  }
+}
+
+// ── Init ─────────────────────────────────────────────────────────────────────
+
+refreshStatus();
+setInterval(refreshStatus, 10000);
+</script>
+</body>
+</html>
