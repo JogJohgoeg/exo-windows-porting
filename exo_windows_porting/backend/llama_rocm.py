@@ -14,19 +14,22 @@ import os
 class LLamaRocmBackend:
     """llama.cpp ROCm backend wrapper."""
     
-    def __init__(self, model_path: str, device_id: int = 0):
+    def __init__(self, model_path: str, device_id: int = 0, n_ctx: int = 8192):
         self.model_path = model_path
         self.device_id = device_id
+        self.n_ctx = n_ctx
         
-        # Initialize llama-cpp-python with ROCm support
+        # Initialize llama-cpp-python with ROCm support.
+        # ROCm is selected at install time via the ROCm-specific wheel;
+        # there is no runtime use_rocm=True flag in llama-cpp-python.
+        # Passing it would raise a TypeError: unexpected keyword argument.
         try:
             from llama_cpp import Llama
             
             self.llm = Llama(
                 model_path=model_path,
-                use_rocm=True,  # Enable ROCm backend
                 n_gpu_layers=-1,  # All layers to GPU (-1 = all)
-                n_ctx=8192,
+                n_ctx=n_ctx,
                 verbose=False
             )
             
@@ -59,13 +62,14 @@ class LLamaRocmBackend:
 
 
 # Factory function for creating ROCm backend instances
-def create_rocm_backend(model_path: str, device_id: int = 0):
+def create_rocm_backend(model_path: str, device_id: int = 0, n_ctx: int = 8192):
     """
     Create a ROCm-accelerated llama.cpp backend.
     
     Args:
         model_path: Path to GGUF model file
         device_id: ROCm device ID (default: 0)
+        n_ctx: Context window size (default: 8192)
         
     Returns:
         LLamaRocmBackend instance
@@ -74,7 +78,7 @@ def create_rocm_backend(model_path: str, device_id: int = 0):
         ImportError: If llama-cpp-python not installed with ROCm support
     """
     
-    return LLamaRocmBackend(model_path=model_path, device_id=device_id)
+    return LLamaRocmBackend(model_path=model_path, device_id=device_id, n_ctx=n_ctx)
 
 
 # Main entry point for testing
