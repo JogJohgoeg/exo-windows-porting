@@ -7,15 +7,17 @@ Author: Exo Windows Porting Team
 License: MIT
 """
 
+import logging
 import os
-import sys
 import socket
-import json
-from typing import List, Dict, Optional, Callable, Awaitable
+import uuid
+from typing import List, Dict, Optional, Callable, Awaitable, Tuple
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
-from threading import Thread, Event
+from threading import Event
 import asyncio
+
+logger = logging.getLogger(__name__)
 
 # Import zeroconf for mDNS/Bonjour support
 try:
@@ -113,7 +115,7 @@ class ExoServiceInfo:
             zeroconf.close()
             
         except Exception as e:
-            print(f"❌ mDNS discovery failed: {e}")
+            logger.error("mDNS discovery failed: %s", e)
         
         return services
 
@@ -139,38 +141,87 @@ class PeerDiscoveryManager:
         await discovery.stop()
     """
     
-    def __init__(self, node_id: str, port: int, host: str = "127.0.0.1"):
+    def __init__(
+        self,
+        node_id: str,
+        port: int,
+        host: str = "127.0.0.1",
+        static_peers: Optional[List[Tuple[str, int]]] = None,
+    ):
+        """
+        Args:
+            node_id:      Unique identifier for this node.
+            port:         Port this node listens on.
+            host:         Bind address for this node.
+            static_peers: Optional list of (host, port) tuples for peers that
+                          should be registered immediately without mDNS.
+                          Use this when mDNS is unavailable (VPN, cross-subnet,
+                          corporate firewall blocking multicast).
+        """
         self.node_id = node_id
         self.port = port
         self.host = host
-        
+
         # mDNS 相关
         self.zeroconf: Optional[Zeroconf] = None
         self.service_browser: Optional[ServiceBrowser] = None
-        
+
         # Peer 节点列表
         self.peers: Dict[str, PeerNodeInfo] = {}
-        
+
         # 事件循环和线程控制
         self.running = False
         self.stop_event = Event()
-        
+        self._loop: Optional[asyncio.AbstractEventLoop] = None  # set in start()
+
         # 回调函数
         self.on_peer_discovered: Optional[Callable[[PeerNodeInfo], Awaitable[None]]] = None
         self.on_peer_lost: Optional[Callable[[str], Awaitable[None]]] = None
-        
-        print(f"🔧 PeerDiscoveryManager initialized for node {node_id}")
+
+        logger.debug("PeerDiscoveryManager initialised for node %s", node_id)
+
+        # Pre-register static peers so the cluster works without mDNS.
+        if static_peers:
+            self._register_static_peers(static_peers)
+
+    def _register_static_peers(self, static_peers: List[Tuple[str, int]]) -> None:
+        """
+        Add manually configured peers to the peer table.
+
+        Each peer gets a synthetic node_id derived from host:port.  Self-entries
+        (matching this node's own host+port) are silently skipped.
+        """
+        for peer_host, peer_port in static_peers:
+            if peer_host == self.host and peer_port == self.port:
+                logger.debug("Skipping self-referencing static peer %s:%d", peer_host, peer_port)
+                continue
+
+            synthetic_id = f"static-{peer_host}-{peer_port}"
+            if synthetic_id in self.peers:
+                continue
+
+            peer = PeerNodeInfo(
+                node_id=synthetic_id,
+                host=peer_host,
+                port=peer_port,
+                last_seen=datetime.now().astimezone().timestamp(),
+                status="static",
+            )
+            self.peers[synthetic_id] = peer
+            logger.info("Static peer registered: %s:%d (id=%s)", peer_host, peer_port, synthetic_id)
     
     async def start(self) -> None:
         """启动 mDNS 服务注册和发现"""
         
         if self.running:
-            print("⚠️ Discovery manager already running")
+            logger.warning("Discovery manager already running")
             return
         
         self.running = True
         self.stop_event.clear()
-        
+        # Capture the running loop so the zeroconf thread can schedule callbacks.
+        self._loop = asyncio.get_running_loop()
+
         try:
             # 初始化 zeroconf
             self.zeroconf = Zeroconf()
@@ -199,7 +250,7 @@ class PeerDiscoveryManager:
             )
             
             self.zeroconf.register_service(service_info)
-            print(f"✅ Registered mDNS service: {service_name}")
+            logger.info("Registered mDNS service: %s", service_name)
             
             # 启动服务发现浏览器
             def on_service_state_change(zeroconf, service_type: str, name: str, state):
@@ -214,10 +265,10 @@ class PeerDiscoveryManager:
                 handlers=[on_service_state_change]
             )
             
-            print(f"🔍 Starting peer discovery for {service_type}")
+            logger.info("Starting mDNS peer discovery for %s", service_type)
             
         except Exception as e:
-            print(f"❌ Failed to start discovery manager: {e}")
+            logger.error("Failed to start discovery manager: %s", e)
             raise
     
     def _on_peer_discovered(self, name: str) -> None:
@@ -253,45 +304,41 @@ class PeerDiscoveryManager:
             
             self.peers[node_id] = peer_info
             
-            print(f"🎉 Discovered new peer: {node_id} @ {peer_info.host}:{peer_info.port}")
+            logger.info("Discovered new peer: %s @ %s:%d", node_id, peer_info.host, peer_info.port)
             
         except Exception as e:
-            print(f"❌ Error processing discovered service: {e}")
+            logger.error("Error processing discovered service: %s", e)
     
     def _on_peer_lost(self, name: str) -> None:
-        """当节点消失时调用"""
-        
+        """Called by the zeroconf ServiceBrowser thread when a peer disappears.
+
+        This runs in a *non-async* thread, so we must use
+        ``run_coroutine_threadsafe`` to schedule the async callback on the
+        event loop that was captured in ``start()``.
+        """
         try:
-            # 从 peers 列表中移除
             for node_id in list(self.peers.keys()):
                 if name.startswith(f"{node_id}."):
                     del self.peers[node_id]
-                    print(f"⚠️ Peer lost: {node_id}")
-                    
-                    # 触发回调 - 使用安全的异步调用方式
-                    if self.on_peer_lost:
-                        try:
-                            loop = asyncio.get_running_loop()
-                            # 在运行中的事件循环中调度任务
-                            asyncio.create_task(self.on_peer_lost(node_id))
-                        except RuntimeError:
-                            # 没有运行中的事件循环，使用 create_task 或同步处理
-                            import threading
-                            threading.Thread(
-                                target=lambda: self._run_callback_async(node_id),
-                                daemon=True
-                            ).start()
-                        
-        except Exception as e:
-            print(f"❌ Error processing lost service: {e}")
-    
-    async def _run_callback_async(self, node_id: str) -> None:
-        """在后台线程中安全运行异步回调"""
-        
-        try:
-            await self.on_peer_lost(node_id)
-        except Exception as e:
-            print(f"❌ Error in peer lost callback for {node_id}: {e}")
+                    logger.warning("Peer lost: %s", node_id)
+
+                    if self.on_peer_lost and self._loop is not None:
+                        future = asyncio.run_coroutine_threadsafe(
+                            self.on_peer_lost(node_id), self._loop
+                        )
+                        # Log errors without blocking the zeroconf thread.
+                        future.add_done_callback(
+                            lambda f, nid=node_id: (
+                                logger.error(
+                                    "peer_lost callback for %s raised: %s", nid, f.exception()
+                                )
+                                if not f.cancelled() and f.exception()
+                                else None
+                            )
+                        )
+
+        except Exception as exc:
+            logger.error("Error processing lost service: %s", exc)
     
     async def discover_peers(self, timeout: float = 5.0) -> List[PeerNodeInfo]:
         """
@@ -324,10 +371,10 @@ class PeerDiscoveryManager:
                 discovered.append(peer_info)
                 self.peers[service.node_id] = peer_info
                 
-            print(f"🔍 Discovered {len(discovered)} peers")
+            logger.info("Discovered %d peer(s)", len(discovered))
             
         except Exception as e:
-            print(f"❌ Manual discovery failed: {e}")
+            logger.error("Manual mDNS discovery failed: %s", e)
         
         return discovered
     
@@ -347,10 +394,10 @@ class PeerDiscoveryManager:
             if self.zeroconf:
                 self.zeroconf.close()
             
-            print("✅ Discovery manager stopped")
+            logger.info("Discovery manager stopped")
             
         except Exception as e:
-            print(f"❌ Error stopping discovery manager: {e}")
+            logger.error("Error stopping discovery manager: %s", e)
 
 
 class SimpleRouter:

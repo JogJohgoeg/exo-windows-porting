@@ -8,28 +8,45 @@ Author: Exo Windows Porting Team
 License: MIT
 """
 
+import logging
+import threading
 from typing import Optional, Dict, Any, Type
 from dataclasses import dataclass
 import os
+
+logger = logging.getLogger(__name__)
+
+_VALID_BACKENDS = frozenset({"rocm", "cuda", "cpu"})
 
 
 @dataclass
 class BackendConfig:
     """Configuration for GPU backend selection."""
-    
+
     # User preferences
     preferred_backend: Optional[str] = None  # "rocm", "cuda", or "cpu"
-    force_cpu: bool = False  # Force CPU-only mode regardless of hardware
-    
+    force_cpu: bool = False
+
     # Hardware constraints
-    min_gpu_memory_mb: int = 4096  # Minimum required VRAM
-    
+    min_gpu_memory_mb: int = 4096
+
     # Performance tuning
     max_tokens: int = 512
     n_ctx: int = 8192
-    
+
     # Debug settings
     verbose: bool = False
+
+    def __post_init__(self) -> None:
+        if self.max_tokens <= 0:
+            raise ValueError(f"max_tokens must be a positive integer, got {self.max_tokens!r}")
+        if self.n_ctx <= 0:
+            raise ValueError(f"n_ctx must be a positive integer, got {self.n_ctx!r}")
+        if self.preferred_backend is not None and self.preferred_backend not in _VALID_BACKENDS:
+            raise ValueError(
+                f"preferred_backend must be one of {sorted(_VALID_BACKENDS)}, "
+                f"got {self.preferred_backend!r}"
+            )
 
 
 class BackendRegistry:
@@ -132,25 +149,16 @@ class HardwareDetector:
         except (subprocess.TimeoutExpired, FileNotFoundError):
             pass
         
-        # Check for AMD GPU (Windows)
+        # AMD GPU + ROCm stack detection (delegates to backend_utils)
         try:
-            import subprocess
-            
-            result = subprocess.run(
-                ["dxdiag", "/T"],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-            
-            if result.returncode == 0 and "AMD" in result.stdout.upper():
-                self.has_amd_gpu = True
-                # Parse AMD GPU info from dxdiag output
-                for line in result.stdout.split("\n"):
-                    if "AMD" in line.upper() or "RADEON" in line.upper():
-                        self.amd_devices.append({"name": line.strip()})
-        except (subprocess.TimeoutExpired, Exception):
-            pass
+            from .backend_utils import detect_hardware as _detect
+            _info = _detect()
+            self.has_amd_gpu = _info.has_amd_gpu
+            self.amd_devices = _info.amd_devices
+            # rocm_ready is what actually matters for backend selection
+            self._rocm_ready = _info.rocm_ready
+        except Exception:
+            self._rocm_ready = False
 
 
 class BackendFactory:
@@ -160,16 +168,22 @@ class BackendFactory:
         self.config = config or BackendConfig()
         self.hardware = HardwareDetector()
         
-        # Initialize registry if not already done (lazy import to avoid circular deps)
-        # Backend classes are imported lazily in create_backend method
-        
-        # Register backends that we know exist
-        from .llama_rocm import LLamaRocmBackend
-        from .llama_cuda import LLamaCudaBackend
+        # Register backends with safe imports so a missing wheel (e.g. ROCm
+        # not installed) doesn't crash factory construction.
+        try:
+            from .llama_rocm import LLamaRocmBackend
+            BackendRegistry.register("rocm", LLamaRocmBackend)
+        except ImportError as exc:
+            logger.debug("ROCm backend unavailable: %s", exc)
+
+        try:
+            from .llama_cuda import LLamaCudaBackend
+            BackendRegistry.register("cuda", LLamaCudaBackend)
+        except ImportError as exc:
+            logger.debug("CUDA backend unavailable: %s", exc)
+
+        # CPU backend is always required — let any ImportError propagate.
         from .llama_cpu import LLamaCpuBackend
-        
-        BackendRegistry.register("rocm", LLamaRocmBackend)
-        BackendRegistry.register("cuda", LLamaCudaBackend)
         BackendRegistry.register("cpu", LLamaCpuBackend)
     
     def select_backend(self) -> str:
@@ -197,10 +211,12 @@ class BackendFactory:
         # Hardware-based selection (priority order)
         if self.hardware.has_nvidia_gpu:
             return "cuda"
-        
-        if self.hardware.has_amd_gpu:
+
+        # Only select ROCm when the software stack is actually installed.
+        # has_amd_gpu alone (detected via dxdiag) is not sufficient.
+        if getattr(self.hardware, "_rocm_ready", False):
             return "rocm"
-        
+
         return "cpu"
     
     def _is_available(self, backend_name: str) -> bool:
@@ -238,33 +254,44 @@ class BackendFactory:
             )
         
         selected = self.select_backend()
-        
+
         if selected == "rocm":
-            from .llama_rocm import LLamaRocmBackend
-            
-            return LLamaRocmBackend(
-                model_path=model_path,
-                device_id=0,
-                n_ctx=self.config.n_ctx
-            )
-        
-        elif selected == "cuda":
-            from .llama_cuda import LLamaCudaBackend
-            
-            return LLamaCudaBackend(
-                model_path=model_path,
-                device_id=0,
-                n_ctx=self.config.n_ctx
-            )
-        
-        else:  # cpu fallback
-            from .llama_cpu import LLamaCpuBackend
-            
-            return LLamaCpuBackend(
-                model_path=model_path,
-                n_ctx=self.config.n_ctx,
-                verbose=self.config.verbose
-            )
+            try:
+                from .llama_rocm import LLamaRocmBackend
+                return LLamaRocmBackend(
+                    model_path=model_path,
+                    device_id=0,
+                    n_ctx=self.config.n_ctx,
+                    verbose=self.config.verbose,
+                )
+            except ImportError:
+                logger.warning(
+                    "ROCm backend selected but wheel not installed — falling back to CPU"
+                )
+                selected = "cpu"
+
+        if selected == "cuda":
+            try:
+                from .llama_cuda import LLamaCudaBackend
+                return LLamaCudaBackend(
+                    model_path=model_path,
+                    device_id=0,
+                    n_ctx=self.config.n_ctx,
+                    verbose=self.config.verbose,
+                )
+            except ImportError:
+                logger.warning(
+                    "CUDA backend selected but wheel not installed — falling back to CPU"
+                )
+                selected = "cpu"
+
+        # CPU fallback (also the explicit "cpu" path)
+        from .llama_cpu import LLamaCpuBackend
+        return LLamaCpuBackend(
+            model_path=model_path,
+            n_ctx=self.config.n_ctx,
+            verbose=self.config.verbose,
+        )
     
     def get_backend_info(self) -> Dict[str, Any]:
         """Get information about available backends."""
@@ -294,18 +321,27 @@ class BackendFactory:
         }
 
 
-# Singleton instance for global access
+# Singleton instance for global access — protected by a lock for thread safety.
 _factory_instance: Optional[BackendFactory] = None
+_factory_lock = threading.Lock()
 
 
 def get_backend_factory(config: Optional[BackendConfig] = None) -> BackendFactory:
-    """Get or create the singleton backend factory instance."""
-    
+    """
+    Return the process-wide BackendFactory singleton.
+
+    Thread-safe via double-checked locking: the common case (already
+    initialised) pays only one attribute read; the lock is only acquired
+    on first call or after a test reset.
+    """
     global _factory_instance
-    
+
     if _factory_instance is None:
-        _factory_instance = BackendFactory(config)
-    
+        with _factory_lock:
+            if _factory_instance is None:
+                _factory_instance = BackendFactory(config)
+                logger.debug("BackendFactory singleton created")
+
     return _factory_instance
 
 
@@ -316,8 +352,6 @@ def detect_hardware() -> HardwareDetector:
 
 
 def get_available_backends() -> Dict[str, bool]:
-    """Get list of available backends."""
-    if _factory_instance is None:
-        BackendFactory()  # Initialize singleton
-    
+    """Get list of available backends (initialises singleton if needed)."""
+    get_backend_factory()   # ensures _factory_instance is set and backends registered
     return BackendRegistry.list_backends()

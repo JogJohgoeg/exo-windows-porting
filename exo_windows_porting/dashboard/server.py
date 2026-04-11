@@ -8,19 +8,50 @@ Author: Exo Windows Porting Team
 License: MIT
 """
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Any
 import asyncio
+import json
+import logging
+import os
 import time
 import uuid
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any, AsyncGenerator, Dict, List, Optional
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Query, Security
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from fastapi.security.api_key import APIKeyHeader
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+
+_EXO_API_KEY: Optional[str] = os.getenv("EXO_API_KEY")
+
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
-# Pydantic Models for Request/Response
+async def verify_api_key(api_key: Optional[str] = Security(_api_key_header)) -> None:
+    """FastAPI dependency — pass through if EXO_API_KEY not set (dev mode)."""
+    if _EXO_API_KEY is None:
+        return  # auth disabled
+    if api_key != _EXO_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+# ---------------------------------------------------------------------------
+# Pydantic Models
+# ---------------------------------------------------------------------------
+
+
 class InferenceRequest(BaseModel):
     """Inference request model."""
-    
+
     prompt: str = Field(..., description="Input text for generation")
     model_path: Optional[str] = Field(None, description="Path to GGUF model file")
     max_tokens: int = Field(512, ge=1, le=8192, description="Maximum tokens to generate")
@@ -32,7 +63,7 @@ class InferenceRequest(BaseModel):
 
 class InferenceResponse(BaseModel):
     """Inference response model."""
-    
+
     success: bool
     text: str = ""
     tokens_generated: int = 0
@@ -44,7 +75,7 @@ class InferenceResponse(BaseModel):
 
 class ModelInfo(BaseModel):
     """Model information model."""
-    
+
     path: str
     size_mb: float
     modified_time: float
@@ -53,7 +84,7 @@ class ModelInfo(BaseModel):
 
 class ClusterStatus(BaseModel):
     """Cluster status model."""
-    
+
     total_nodes: int = 0
     active_nodes: int = 0
     total_gpu_memory_gb: float = 0.0
@@ -61,88 +92,252 @@ class ClusterStatus(BaseModel):
     uptime_seconds: float = 0.0
 
 
+# ---------------------------------------------------------------------------
 # FastAPI Application
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _server_start_time
+    _server_start_time = time.time()
+    logger.info("Exo Windows Porting API started")
+    yield
+    logger.info("Exo Windows Porting API stopped")
+
+
 app = FastAPI(
     title="Exo Windows Porting API",
     description="REST API for distributed LLM inference on Windows with ROCm/CUDA support",
     version="0.1.0",
     docs_url="/docs",
-    redoc_url="/redoc"
+    redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
-# Enable CORS for cross-origin requests
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Serve static dashboard UI at /ui (index.html)
+_static_dir = Path(__file__).parent / "static"
+if _static_dir.is_dir():
+    app.mount("/ui", StaticFiles(directory=str(_static_dir), html=True), name="ui")
 
-# Global state (in production, use proper database/cache)
+# ---------------------------------------------------------------------------
+# Global State
+# ---------------------------------------------------------------------------
+
 _inference_queue: List[Dict[str, Any]] = []
 _model_cache: Dict[str, ModelInfo] = {}
 _cluster_status = ClusterStatus()
+_server_start_time: float = time.time()
+
+# Distributed engine (optional — set via /v1/distributed/setup)
+_dist_engine = None     # DistributedPipelineEngine | None
+_dist_scheduler = None  # AdaptiveScheduler | None
+_dist_hypergraph = None # HypergraphTopology | None
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+async def _process_inference_task(
+    request: InferenceRequest,
+    request_id: str,
+) -> Dict[str, Any]:
+    """
+    Execute an inference request.
+
+    Routes to the distributed pipeline engine if one is configured
+    (via /v1/distributed/setup), otherwise falls back to the single-node
+    BackendFactory.
+    """
+    try:
+        # ── Distributed engine path ───────────────────────────────────────
+        if _dist_engine is not None:
+            start = time.time()
+            result_text = await _dist_engine.generate(
+                prompt=request.prompt,
+                max_tokens=request.max_tokens,
+            )
+            elapsed_ms = (time.time() - start) * 1000
+            tokens_generated = len(result_text.split()) if result_text else 0
+            throughput = tokens_generated / (elapsed_ms / 1000) if elapsed_ms > 0 else 0.0
+            return {
+                "success": True,
+                "text": result_text or "",
+                "tokens_generated": tokens_generated,
+                "time_ms": round(elapsed_ms, 2),
+                "throughput_tok_s": round(throughput, 2),
+                "backend": _dist_engine.get_backend_name(),
+            }
+
+        # ── Single-node backend path ──────────────────────────────────────
+        from exo_windows_porting.backend.factory import get_backend_factory
+
+        factory = get_backend_factory()
+
+        if request.gpu_required and (
+            not factory.hardware.has_nvidia_gpu and not factory.hardware.has_amd_gpu
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="GPU required but no GPU available on this system",
+            )
+
+        backend = factory.create_backend(
+            model_path=request.model_path,
+            force_cpu=False,
+        )
+
+        start = time.time()
+        result_text = await backend.generate(
+            prompt=request.prompt,
+            max_tokens=request.max_tokens,
+        )
+        elapsed_ms = (time.time() - start) * 1000
+
+        tokens_generated = len(result_text.split()) if result_text else 0
+        throughput = tokens_generated / (elapsed_ms / 1000) if elapsed_ms > 0 else 0.0
+
+        return {
+            "success": True,
+            "text": result_text or "",
+            "tokens_generated": tokens_generated,
+            "time_ms": round(elapsed_ms, 2),
+            "throughput_tok_s": round(throughput, 2),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error processing inference task %s", request_id)
+        return {
+            "success": False,
+            "error_message": str(e),
+            "tokens_generated": 0,
+            "time_ms": 0.0,
+            "throughput_tok_s": 0.0,
+        }
+
+
+async def _stream_inference(request: InferenceRequest) -> AsyncGenerator[str, None]:
+    """
+    Async generator that yields SSE-formatted lines.
+
+    Routes to the distributed engine (if configured) or falls back to the
+    single-node BackendFactory.  Both paths use generate_stream() where
+    available, falling back to a single-chunk emit via generate().
+    """
+    try:
+        # ── Distributed engine path ───────────────────────────────────────
+        if _dist_engine is not None:
+            async for token in _dist_engine.generate_stream(
+                request.prompt, max_tokens=request.max_tokens
+            ):
+                yield f"data: {json.dumps({'token': token})}\n\n"
+                await asyncio.sleep(0)
+            yield "data: [DONE]\n\n"
+            return
+
+        # ── Single-node backend path ──────────────────────────────────────
+        from exo_windows_porting.backend.factory import get_backend_factory
+
+        factory = get_backend_factory()
+
+        if request.gpu_required and (
+            not factory.hardware.has_nvidia_gpu and not factory.hardware.has_amd_gpu
+        ):
+            yield f"data: {json.dumps({'error': 'GPU required but not available'})}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+        backend = factory.create_backend(
+            model_path=request.model_path,
+            force_cpu=False,
+        )
+
+        if hasattr(backend, "generate_stream"):
+            async for token in backend.generate_stream(
+                request.prompt, max_tokens=request.max_tokens
+            ):
+                yield f"data: {json.dumps({'token': token})}\n\n"
+                await asyncio.sleep(0)
+        else:
+            text = await backend.generate(
+                prompt=request.prompt, max_tokens=request.max_tokens,
+            )
+            yield f"data: {json.dumps({'token': text})}\n\n"
+
+    except Exception as e:
+        logger.exception("Streaming inference error")
+        yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+    yield "data: [DONE]\n\n"
+
+
+# ---------------------------------------------------------------------------
+# Routes — public (no auth)
+# ---------------------------------------------------------------------------
 
 
 @app.get("/")
 async def root():
-    """Root endpoint - API health check."""
-    
+    """Root endpoint — redirects browsers to /ui, returns JSON for API clients."""
     return {
         "status": "healthy",
         "title": app.title,
-        "version": app.version
+        "version": app.version,
+        "dashboard": "/ui",
     }
 
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint."""
-    
+    """Health check endpoint (unauthenticated)."""
     return {
         "status": "ok",
         "timestamp": time.time(),
-        "uptime_seconds": _cluster_status.uptime_seconds
+        "uptime_seconds": round(time.time() - _server_start_time, 1),
     }
 
 
-@app.post("/v1/inference", response_model=InferenceResponse)
+# ---------------------------------------------------------------------------
+# Routes — protected (require API key when EXO_API_KEY is set)
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/v1/inference",
+    response_model=InferenceResponse,
+    dependencies=[Depends(verify_api_key)],
+)
 async def run_inference(
     request: InferenceRequest,
-    background_tasks: BackgroundTasks
+    background_tasks: BackgroundTasks,
 ):
-    """Run inference on the distributed cluster."""
-    
+    """Run inference on the distributed cluster (blocking, returns full text)."""
+    if not request.model_path:
+        raise HTTPException(status_code=400, detail="model_path is required")
+
+    if request.model_path not in _model_cache:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Model not found: {request.model_path}",
+        )
+
+    request_id = str(uuid.uuid4())
+    _inference_queue.append(
+        {"id": request_id, "status": "queued", "created_at": time.time()}
+    )
+
     try:
-        # Validate model path
-        if not request.model_path:
-            raise HTTPException(status_code=400, detail="Model path is required")
-        
-        # Check if model is cached/available
-        if request.model_path not in _model_cache:
-            raise HTTPException(
-                status_code=404, 
-                detail=f"Model not found: {request.model_path}"
-            )
-        
-        # Create unique request ID
-        request_id = str(uuid.uuid4())
-        
-        # Add to processing queue (in production, use proper task queue)
-        task_info = {
-            "id": request_id,
-            "status": "queued",
-            "request": request.dict(),
-            "created_at": time.time()
-        }
-        
-        _inference_queue.append(task_info)
-        
-        # Process asynchronously (simplified - in production use proper async handling)
-        result = await process_inference_task(request, request_id)
-        
+        result = await _process_inference_task(request, request_id)
         return InferenceResponse(
             success=result["success"],
             text=result.get("text", ""),
@@ -150,178 +345,297 @@ async def run_inference(
             time_ms=result.get("time_ms", 0.0),
             throughput_tok_s=result.get("throughput_tok_s", 0.0),
             error_message=result.get("error_message"),
-            request_id=request_id
+            request_id=request_id,
         )
-        
     except HTTPException:
         raise
     except Exception as e:
         return InferenceResponse(
             success=False,
             error_message=str(e),
-            request_id=str(uuid.uuid4())
+            request_id=request_id,
         )
 
 
-async def process_inference_task(request: InferenceRequest, request_id: str):
-    """Process an inference task (simplified implementation)."""
-    
-    from exo_windows_porting.backend.factory import get_backend_factory
-    
-    try:
-        # Get backend factory
-        factory = get_backend_factory()
-        
-        # Create backend instance with force_cpu if GPU not available when required
-        if request.gpu_required and (not factory.hardware.has_nvidia_gpu and not factory.hardware.has_amd_gpu):
-            raise HTTPException(
-                status_code=400, 
-                detail="GPU required but no GPU available on this system"
-            )
-        
-        backend = factory.create_backend(
-            model_path=request.model_path,
-            force_cpu=(not request.gpu_required)  # Force CPU if GPU not requested
+@app.post(
+    "/v1/completions/stream",
+    dependencies=[Depends(verify_api_key)],
+    summary="Streaming inference (SSE)",
+    response_description="Server-Sent Events stream of token objects",
+)
+async def run_inference_stream(request: InferenceRequest):
+    """
+    Stream inference results as Server-Sent Events.
+
+    Each event has the form::
+
+        data: {"token": "<text>"}
+
+    The stream ends with::
+
+        data: [DONE]
+
+    Errors are reported as::
+
+        data: {"error": "<message>"}
+    """
+    if request.model_path and request.model_path not in _model_cache:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Model not found: {request.model_path}",
         )
-        
-        # Execute inference
-        start_time = time.time()
-        result_text = await backend.generate(
-            prompt=request.prompt,
-            max_tokens=request.max_tokens
-        )
-        elapsed_ms = (time.time() - start_time) * 1000
-        
-        # Calculate metrics
-        tokens_generated = len(result_text.split()) if result_text else 0
-        throughput = tokens_generated / (elapsed_ms / 1000) if elapsed_ms > 0 else 0
-        
-        return {
-            "success": True,
-            "text": result_text or "",
-            "tokens_generated": tokens_generated,
-            "time_ms": round(elapsed_ms, 2),
-            "throughput_tok_s": round(throughput, 2)
-        }
-        
-    except HTTPException:
-        # Re-raise HTTP exceptions to be handled by FastAPI
-        raise
-    except Exception as e:
-        import traceback
-        
-        # Log full traceback for debugging (in production, use proper logging)
-        print(f"Error processing inference task {request_id}: {e}")
-        traceback.print_exc()
-        
-        return {
-            "success": False,
-            "error_message": str(e),
-            "tokens_generated": 0,
-            "time_ms": 0.0,
-            "throughput_tok_s": 0.0
-        }
+
+    return StreamingResponse(
+        _stream_inference(request),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",   # disable nginx buffering
+        },
+    )
 
 
-@app.get("/v1/models", response_model=List[ModelInfo])
+@app.get(
+    "/v1/models",
+    response_model=List[ModelInfo],
+    dependencies=[Depends(verify_api_key)],
+)
 async def list_models():
-    """List available models in the cache."""
-    
+    """List models registered in the cache."""
     return list(_model_cache.values())
 
 
-@app.post("/v1/models/upload")
+@app.post(
+    "/v1/models/upload",
+    dependencies=[Depends(verify_api_key)],
+)
 async def upload_model(
     model_path: str = Query(..., description="Path to GGUF model file"),
-    size_mb: float = Query(..., description="Model size in MB")
+    size_mb: float = Query(..., description="Model size in MB"),
 ):
-    """Register a new model in the cache."""
-    
-    import os
-    
+    """Register a model in the cache by filesystem path."""
     if not os.path.exists(model_path):
         raise HTTPException(status_code=404, detail=f"Model file not found: {model_path}")
-    
-    import time as time_module
-    
+
     stat = os.stat(model_path)
-    
     model_info = ModelInfo(
         path=model_path,
         size_mb=size_mb,
         modified_time=stat.st_mtime,
-        available=True
+        available=True,
     )
-    
     _model_cache[model_path] = model_info
-    
     return model_info
 
 
-@app.get("/v1/cluster/status", response_model=ClusterStatus)
+@app.get(
+    "/v1/cluster/status",
+    response_model=ClusterStatus,
+    dependencies=[Depends(verify_api_key)],
+)
 async def get_cluster_status():
-    """Get current cluster status."""
-    
-    # Update uptime
-    _cluster_status.uptime_seconds += 1
-    
+    """Get current cluster status (live data from hypergraph when active)."""
+    _cluster_status.uptime_seconds = round(time.time() - _server_start_time, 1)
+
+    if _dist_hypergraph is not None:
+        nodes = _dist_hypergraph.nodes
+        _cluster_status.total_nodes = len(nodes)
+        _cluster_status.active_nodes = len(nodes)
+        _cluster_status.total_gpu_memory_gb = round(
+            sum(n.gpu_memory_mb for n in nodes.values()) / 1024, 2
+        )
+        if _dist_scheduler is not None:
+            metrics = _dist_scheduler.metrics_summary()
+            lats = [m["avg_latency_ms"] for m in metrics.values() if m["avg_latency_ms"] > 0]
+            if lats:
+                # Report load as a fraction of the slowest possible latency (capped at 100 %)
+                _cluster_status.average_load_percent = round(
+                    min(100.0, sum(lats) / len(lats) / 100), 1
+                )
+
     return _cluster_status
 
 
-@app.delete("/v1/models/{model_path}")
+@app.delete(
+    "/v1/models/{model_path:path}",
+    dependencies=[Depends(verify_api_key)],
+)
 async def delete_model(model_path: str):
     """Remove a model from the cache."""
-    
     if model_path not in _model_cache:
         raise HTTPException(status_code=404, detail=f"Model not found: {model_path}")
-    
     del _model_cache[model_path]
-    
     return {"status": "deleted", "path": model_path}
 
 
-@app.get("/v1/models/{model_path}/info", response_model=ModelInfo)
+@app.get(
+    "/v1/models/{model_path:path}/info",
+    response_model=ModelInfo,
+    dependencies=[Depends(verify_api_key)],
+)
 async def get_model_info(model_path: str):
     """Get information about a specific model."""
-    
     if model_path not in _model_cache:
         raise HTTPException(status_code=404, detail=f"Model not found: {model_path}")
-    
     return _model_cache[model_path]
 
 
-@app.get("/v1/health/backends")
+@app.get(
+    "/v1/health/backends",
+    dependencies=[Depends(verify_api_key)],
+)
 async def check_backends():
     """Check status of all available backends."""
-    
     from exo_windows_porting.backend.factory import get_backend_factory
-    
+
     factory = get_backend_factory()
     info = factory.get_backend_info()
-    
     return {
         "hardware": info["hardware"],
         "available_backends": info["available_backends"],
-        "selected_backend": info["selected_backend"]
+        "selected_backend": info["selected_backend"],
     }
 
 
-# Startup event
-@app.on_event("startup")
-async def startup_event():
-    """Initialize application on startup."""
-    
-    global _cluster_status
-    
-    import time as time_module
-    
-    _cluster_status.uptime_seconds = 0.0
-    print(f"🚀 Exo Windows Porting API started at {time.strftime('%H:%M:%S')}")
+# ---------------------------------------------------------------------------
+# Distributed engine endpoints
+# ---------------------------------------------------------------------------
 
 
-# Shutdown event
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Cleanup on shutdown."""
-    
-    print(f"🛑 Exo Windows Porting API stopped at {time.strftime('%H:%M:%S')}")
+class NodeSpec(BaseModel):
+    """Specification for one node in a distributed cluster."""
+    node_id: str
+    host: str
+    gpu_memory_mb: int
+    port: int = 29500
+    bandwidth_gbps: float = 16.0
+    nvlink: bool = False
+    cpu_cores: int = 8
+
+
+class DistributedSetupRequest(BaseModel):
+    """Request body for /v1/distributed/setup."""
+    model_id: str = Field(..., description="HuggingFace model ID or label")
+    n_layers: int = Field(..., ge=1, description="Total transformer layers in the model")
+    nodes: List[NodeSpec]
+    layer_memory_mb: int = Field(200, ge=1, description="VRAM footprint per layer (MB)")
+    local_mode: bool = Field(False, description="Run all shards in-process (testing)")
+    enable_scheduler: bool = Field(True, description="Attach AdaptiveScheduler")
+    imbalance_threshold: float = Field(0.35, description="Scheduler rebalance threshold")
+
+
+@app.post(
+    "/v1/distributed/setup",
+    dependencies=[Depends(verify_api_key)],
+    summary="Configure and start distributed inference engine",
+)
+async def setup_distributed(req: DistributedSetupRequest):
+    """
+    Build a HypergraphTopology, solve shard assignment, and start the
+    distributed pipeline engine.  Subsequent /v1/inference calls will
+    route through the distributed engine instead of the single-node backend.
+    """
+    global _dist_engine, _dist_scheduler, _dist_hypergraph
+
+    from exo_windows_porting.distributed.constraint_solver import ConstraintSolver, SolverConfig
+    from exo_windows_porting.distributed.hypergraph import build_hypergraph_topology
+    from exo_windows_porting.distributed.pipeline import DistributedPipelineEngine
+    from exo_windows_porting.distributed.adaptive_scheduler import AdaptiveScheduler
+
+    # Tear down any existing engine first
+    if _dist_engine is not None:
+        try:
+            await _dist_engine.stop()
+        except Exception:
+            pass
+        _dist_engine = None
+        _dist_scheduler = None
+        _dist_hypergraph = None
+
+    node_dicts = [n.dict() for n in req.nodes]
+    topo = build_hypergraph_topology(req.model_id, req.n_layers, node_dicts)
+
+    cfg = SolverConfig(layer_memory_mb=req.layer_memory_mb)
+    try:
+        ConstraintSolver(cfg).solve(topo)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    engine = DistributedPipelineEngine.from_hypergraph(
+        topo, local_mode=req.local_mode
+    )
+
+    scheduler = None
+    if req.enable_scheduler:
+        scheduler = AdaptiveScheduler(
+            topo, imbalance_threshold=req.imbalance_threshold
+        )
+        engine.set_scheduler(scheduler)
+
+    if req.local_mode:
+        await engine.start()
+
+    _dist_engine = engine
+    _dist_scheduler = scheduler
+    _dist_hypergraph = topo
+
+    # Update cluster status counters
+    _cluster_status.total_nodes = len(req.nodes)
+    _cluster_status.active_nodes = len(req.nodes)
+    _cluster_status.total_gpu_memory_gb = sum(n.gpu_memory_mb for n in req.nodes) / 1024
+
+    return {
+        "status": "ok",
+        "topology": topo.to_dict(),
+        "scheduler_enabled": scheduler is not None,
+    }
+
+
+@app.get(
+    "/v1/distributed/topology",
+    dependencies=[Depends(verify_api_key)],
+    summary="Current hypergraph topology",
+)
+async def get_distributed_topology():
+    """Return the current solved HypergraphTopology as JSON."""
+    if _dist_hypergraph is None:
+        return {"active": False, "topology": None}
+    return {"active": True, "topology": _dist_hypergraph.to_dict()}
+
+
+@app.get(
+    "/v1/distributed/scheduler/metrics",
+    dependencies=[Depends(verify_api_key)],
+    summary="Adaptive scheduler metrics",
+)
+async def get_scheduler_metrics():
+    """Return per-shard latency, KV hit rate, and rebalance history."""
+    if _dist_scheduler is None:
+        return {"active": False, "metrics": {}, "rebalance_count": 0}
+    return {
+        "active": True,
+        "metrics": _dist_scheduler.metrics_summary(),
+        "rebalance_count": _dist_scheduler.rebalance_count,
+    }
+
+
+@app.post(
+    "/v1/distributed/stop",
+    dependencies=[Depends(verify_api_key)],
+    summary="Gracefully stop the distributed engine",
+)
+async def stop_distributed():
+    """Stop all local workers and release ZMQ resources."""
+    global _dist_engine, _dist_scheduler, _dist_hypergraph
+    if _dist_engine is None:
+        return {"status": "not_running"}
+    await _dist_engine.stop()
+    _dist_engine = None
+    _dist_scheduler = None
+    _dist_hypergraph = None
+    _cluster_status.total_nodes = 0
+    _cluster_status.active_nodes = 0
+    _cluster_status.total_gpu_memory_gb = 0.0
+    return {"status": "stopped"}
+
+

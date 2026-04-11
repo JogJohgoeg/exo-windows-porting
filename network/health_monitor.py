@@ -8,10 +8,13 @@ License: MIT
 """
 
 import asyncio
+import logging
 from typing import Dict, List, Optional, Callable, Awaitable
 from dataclasses import dataclass
 from datetime import datetime
 import socket
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -80,15 +83,15 @@ class HealthMonitor:
         """Start the monitoring loop"""
         
         if self.running:
-            print("⚠️ Monitor already running")
+            logger.warning("Monitor already running")
             return
         
         self.running = True
         
         # Start background monitoring task
         self.monitor_task = asyncio.create_task(self._monitor_loop())
-        
-        print(f"🔍 Health monitor started (interval: {self.check_interval}s)")
+
+        logger.info("Health monitor started (interval=%ds)", self.check_interval)
     
     async def stop(self) -> None:
         """Stop the monitoring loop"""
@@ -105,7 +108,7 @@ class HealthMonitor:
             except asyncio.CancelledError:
                 pass
         
-        print("✅ Health monitor stopped")
+        logger.info("Health monitor stopped")
     
     async def _monitor_loop(self) -> None:
         """Background monitoring loop"""
@@ -122,8 +125,8 @@ class HealthMonitor:
                 await asyncio.sleep(self.check_interval)
             
             except Exception as e:
-                print(f"❌ Monitor loop error: {e}")
-                await asyncio.sleep(5)  # Back off on error
+                logger.error("Monitor loop error: %s", e)
+                await asyncio.sleep(5)
     
     async def _check_node(self, node_id: str) -> None:
         """Check health of a specific node
@@ -153,25 +156,13 @@ class HealthMonitor:
             
             # Detect state transition: unhealthy → healthy
             if old_status and not old_status.is_healthy:
-                print(f"✅ Node {node_id} recovered")
-                
+                logger.info("Node %s recovered", node_id)
+
                 if self.on_node_healthy:
                     try:
                         await self.on_node_healthy(node_id)
                     except Exception as callback_error:
-                        print(f"❌ Error in on_node_healthy callback for {node_id}: {callback_error}")
-            
-            # Detect state transition: healthy → unhealthy (first time check)
-            elif old_status is None and not self.node_status.get(node_id, HealthStatus(
-                node_id=node_id, is_healthy=True, last_check_time=0
-            )).is_healthy:
-                print(f"⚠️ Node {node_id} first seen as unhealthy")
-                
-                if self.on_node_unhealthy:
-                    try:
-                        await self.on_node_unhealthy(node_id, "First check failed")
-                    except Exception as callback_error:
-                        print(f"❌ Error in on_node_unhealthy callback for {node_id}: {callback_error}")
+                        logger.error("on_node_healthy callback error for %s: %s", node_id, callback_error)
             
             # Create or update status
             new_status = HealthStatus(
@@ -184,23 +175,20 @@ class HealthMonitor:
             self.node_status[node_id] = new_status
             
         except Exception as e:
-            import traceback
-            
-            print(f"❌ Node {node_id} health check failed: {e}")
-            traceback.print_exc()
-            
+            logger.warning("Node %s health check failed: %s", node_id, e)
+
             # Update status to unhealthy
             old_status = self.node_status.get(node_id)
-            
+
             # Detect state transition: healthy → unhealthy
             if old_status and old_status.is_healthy:
-                print(f"⚠️ Node {node_id} now unhealthy")
-                
+                logger.warning("Node %s is now unhealthy", node_id)
+
                 if self.on_node_unhealthy:
                     try:
                         await self.on_node_unhealthy(node_id, str(e))
                     except Exception as callback_error:
-                        print(f"❌ Error in on_node_unhealthy callback for {node_id}: {callback_error}")
+                        logger.error("on_node_unhealthy callback error for %s: %s", node_id, callback_error)
             
             # Create unhealthy status (or update existing)
             self.node_status[node_id] = HealthStatus(
@@ -211,22 +199,35 @@ class HealthMonitor:
             )
     
     async def _send_ping(self, node_id: str) -> Optional[float]:
-        """Send ping to a node and measure latency"""
-        
-        # This is a simplified implementation
-        # In production, you would use actual network communication
-        
+        """
+        Measure TCP round-trip time to a node.
+
+        Looks up the node's host/port from node_status metadata if available,
+        otherwise falls back to a loopback check on the default port.
+        Returns latency in milliseconds.
+
+        Raises:
+            OSError: If the connection is refused or times out.
+        """
+        status = self.node_status.get(node_id)
+        host = getattr(status, "host", "127.0.0.1") if status else "127.0.0.1"
+        port = getattr(status, "port", 18790) if status else 18790
+
+        loop = asyncio.get_running_loop()
+        start = loop.time()
         try:
-            import random
-            
-            # Simulate network latency (10-50ms for local network)
-            simulated_latency = random.uniform(10.0, 50.0)
-            
-            return simulated_latency
-            
-        except Exception as e:
-            print(f"❌ Ping failed to {node_id}: {e}")
-            raise
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port),
+                timeout=5.0,
+            )
+            writer.close()
+            await writer.wait_closed()
+        except asyncio.TimeoutError:
+            raise OSError(f"TCP ping to {host}:{port} timed out")
+
+        latency_ms = (loop.time() - start) * 1000
+        logger.debug("Ping %s (%s:%d) = %.1f ms", node_id, host, port, latency_ms)
+        return latency_ms
     
     def get_offline_nodes(self) -> List[str]:
         """Get list of offline nodes"""
@@ -268,28 +269,31 @@ class HealthMonitor:
 # Health check utility functions
 async def ping_node(host: str, port: int, timeout: float = 5.0) -> bool:
     """
-    Check if a node is reachable via TCP ping.
-    
+    Check if a node is reachable via async TCP ping.
+
+    Uses asyncio.open_connection() so the event loop is never blocked.
+
     Args:
         host: Node hostname or IP address
         port: Node port number
         timeout: Connection timeout in seconds
-        
+
     Returns:
         True if node is reachable, False otherwise
     """
-    
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(timeout)
-        
-        result = sock.connect_ex((host, port))
-        sock.close()
-        
-        return result == 0
-        
-    except Exception as e:
-        print(f"❌ Ping failed to {host}:{port}: {e}")
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port),
+            timeout=timeout,
+        )
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return True
+    except Exception as exc:
+        logger.debug("Ping failed to %s:%d: %s", host, port, exc)
         return False
 
 
@@ -321,54 +325,30 @@ async def get_node_info(host: str, port: int) -> Optional[Dict]:
         }
         
     except Exception as e:
-        print(f"❌ Failed to get node info from {host}:{port}: {e}")
+        logger.warning("Failed to get node info from %s:%d: %s", host, port, e)
         return None
-
-
-# Main entry point for testing
-if __name__ == "__main__":
-    async def main():
-        # Create health monitor
-        monitor = HealthMonitor(coordinator_node_id="exo-coordinator-001")
-        
-        try:
-            # Register some nodes (for testing)
-            monitor.node_status["node-1"] = HealthStatus(
-                node_id="node-1",
-                is_healthy=True,
-                last_check_time=time.time(),
-                ping_latency_ms=25.0
-            )
-            
-            monitor.node_status["node-2"] = HealthStatus(
-                node_id="node-2", 
-                is_healthy=False,
-                last_check_time=time.time() - 100,  # Offline for 100s
-                error_message="Connection timeout"
-            )
-            
-            # Start monitoring
-            await monitor.start()
-            
-            print("🔍 Monitoring started...")
-            
-            # Wait a bit to see results
-            await asyncio.sleep(65)  # ~2 check cycles
-            
-        except KeyboardInterrupt:
-            print("\n⚠️ Stopping health monitor...")
-        finally:
-            await monitor.stop()
-        
-        # Print final status
-        print("\n📊 Final Health Status:")
-        for node_id, status in monitor.node_status.items():
-            if status.is_healthy:
-                print(f"   ✅ {node_id}: Healthy (latency: {status.ping_latency_ms:.1f}ms)")
-            else:
-                print(f"   ❌ {node_id}: Unhealthy ({status.error_message})")
 
 
 if __name__ == "__main__":
     import time
+
+    async def main():
+        monitor = HealthMonitor(coordinator_node_id="exo-coordinator-001")
+        try:
+            monitor.node_status["node-1"] = HealthStatus(
+                node_id="node-1", is_healthy=True,
+                last_check_time=time.time(), ping_latency_ms=25.0
+            )
+            monitor.node_status["node-2"] = HealthStatus(
+                node_id="node-2", is_healthy=False,
+                last_check_time=time.time() - 100,
+                error_message="Connection timeout"
+            )
+            await monitor.start()
+            await asyncio.sleep(65)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            await monitor.stop()
+
     asyncio.run(main())
