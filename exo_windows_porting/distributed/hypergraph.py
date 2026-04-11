@@ -170,6 +170,83 @@ class HypergraphTopology:
         ]
         return ClusterTopology(model_id=self.model_id, shards=shards)
 
+    # ------------------------------------------------------------------
+    # Serialisation / persistence
+    # ------------------------------------------------------------------
+
+    def to_dict(self) -> dict:
+        """Serialise topology to a JSON-compatible dict."""
+        return {
+            "model_id": self.model_id,
+            "n_layers": self.n_layers,
+            "nodes": {
+                nid: {
+                    "node_id": n.node_id,
+                    "host": n.host,
+                    "port": n.port,
+                    "gpu_memory_mb": n.gpu_memory_mb,
+                    "bandwidth_gbps": n.bandwidth_gbps,
+                    "nvlink": n.nvlink,
+                    "cpu_cores": n.cpu_cores,
+                    "current_load": n.current_load,
+                }
+                for nid, n in self.nodes.items()
+            },
+            "edges": {
+                eid: {
+                    "edge_id": e.edge_id,
+                    "source_ids": e.source_ids,
+                    "target_ids": e.target_ids,
+                    "bandwidth_gbps": e.bandwidth_gbps,
+                    "latency_us": e.latency_us,
+                }
+                for eid, e in self.edges.items()
+            },
+            "shard_map": {nid: list(rng) for nid, rng in self.shard_map.items()},
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "HypergraphTopology":
+        """Deserialise topology from a dict (e.g. loaded from JSON)."""
+        topo = cls(model_id=data["model_id"], n_layers=data["n_layers"])
+        for nd in data["nodes"].values():
+            topo.nodes[nd["node_id"]] = HyperNode(
+                node_id=nd["node_id"],
+                host=nd["host"],
+                port=nd["port"],
+                gpu_memory_mb=nd["gpu_memory_mb"],
+                bandwidth_gbps=nd.get("bandwidth_gbps", 16.0),
+                nvlink=nd.get("nvlink", False),
+                cpu_cores=nd.get("cpu_cores", 8),
+                current_load=nd.get("current_load", 0.0),
+            )
+        for ed in data["edges"].values():
+            topo.edges[ed["edge_id"]] = HyperEdge(
+                edge_id=ed["edge_id"],
+                source_ids=ed["source_ids"],
+                target_ids=ed["target_ids"],
+                bandwidth_gbps=ed["bandwidth_gbps"],
+                latency_us=ed.get("latency_us", 50.0),
+            )
+        topo.shard_map = {nid: tuple(rng) for nid, rng in data["shard_map"].items()}
+        return topo
+
+    def save(self, path: str) -> None:
+        """Save solved topology to a JSON file."""
+        import json
+        with open(path, "w") as f:
+            json.dump(self.to_dict(), f, indent=2)
+        logger.info("Topology saved to %s", path)
+
+    @classmethod
+    def load(cls, path: str) -> "HypergraphTopology":
+        """Load a solved topology from a JSON file."""
+        import json
+        with open(path) as f:
+            return cls.from_dict(json.load(f))
+
+    # ------------------------------------------------------------------
+
     def __repr__(self) -> str:
         lines = [f"HypergraphTopology(model={self.model_id}, layers={self.n_layers})"]
         for nid, (s, e) in sorted(self.shard_map.items(), key=lambda x: x[1][0]):

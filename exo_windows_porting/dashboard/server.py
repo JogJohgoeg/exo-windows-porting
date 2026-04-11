@@ -136,6 +136,11 @@ _model_cache: Dict[str, ModelInfo] = {}
 _cluster_status = ClusterStatus()
 _server_start_time: float = time.time()
 
+# Distributed engine (optional — set via /v1/distributed/setup)
+_dist_engine = None     # DistributedPipelineEngine | None
+_dist_scheduler = None  # AdaptiveScheduler | None
+_dist_hypergraph = None # HypergraphTopology | None
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -145,10 +150,36 @@ async def _process_inference_task(
     request: InferenceRequest,
     request_id: str,
 ) -> Dict[str, Any]:
-    """Execute an inference request and return a result dict."""
-    from exo_windows_porting.backend.factory import get_backend_factory
+    """
+    Execute an inference request.
 
+    Routes to the distributed pipeline engine if one is configured
+    (via /v1/distributed/setup), otherwise falls back to the single-node
+    BackendFactory.
+    """
     try:
+        # ── Distributed engine path ───────────────────────────────────────
+        if _dist_engine is not None:
+            start = time.time()
+            result_text = await _dist_engine.generate(
+                prompt=request.prompt,
+                max_tokens=request.max_tokens,
+            )
+            elapsed_ms = (time.time() - start) * 1000
+            tokens_generated = len(result_text.split()) if result_text else 0
+            throughput = tokens_generated / (elapsed_ms / 1000) if elapsed_ms > 0 else 0.0
+            return {
+                "success": True,
+                "text": result_text or "",
+                "tokens_generated": tokens_generated,
+                "time_ms": round(elapsed_ms, 2),
+                "throughput_tok_s": round(throughput, 2),
+                "backend": _dist_engine.get_backend_name(),
+            }
+
+        # ── Single-node backend path ──────────────────────────────────────
+        from exo_windows_porting.backend.factory import get_backend_factory
+
         factory = get_backend_factory()
 
         if request.gpu_required and (
@@ -434,5 +465,147 @@ async def check_backends():
         "available_backends": info["available_backends"],
         "selected_backend": info["selected_backend"],
     }
+
+
+# ---------------------------------------------------------------------------
+# Distributed engine endpoints
+# ---------------------------------------------------------------------------
+
+
+class NodeSpec(BaseModel):
+    """Specification for one node in a distributed cluster."""
+    node_id: str
+    host: str
+    gpu_memory_mb: int
+    port: int = 29500
+    bandwidth_gbps: float = 16.0
+    nvlink: bool = False
+    cpu_cores: int = 8
+
+
+class DistributedSetupRequest(BaseModel):
+    """Request body for /v1/distributed/setup."""
+    model_id: str = Field(..., description="HuggingFace model ID or label")
+    n_layers: int = Field(..., ge=1, description="Total transformer layers in the model")
+    nodes: List[NodeSpec]
+    layer_memory_mb: int = Field(200, ge=1, description="VRAM footprint per layer (MB)")
+    local_mode: bool = Field(False, description="Run all shards in-process (testing)")
+    enable_scheduler: bool = Field(True, description="Attach AdaptiveScheduler")
+    imbalance_threshold: float = Field(0.35, description="Scheduler rebalance threshold")
+
+
+@app.post(
+    "/v1/distributed/setup",
+    dependencies=[Depends(verify_api_key)],
+    summary="Configure and start distributed inference engine",
+)
+async def setup_distributed(req: DistributedSetupRequest):
+    """
+    Build a HypergraphTopology, solve shard assignment, and start the
+    distributed pipeline engine.  Subsequent /v1/inference calls will
+    route through the distributed engine instead of the single-node backend.
+    """
+    global _dist_engine, _dist_scheduler, _dist_hypergraph
+
+    from exo_windows_porting.distributed.constraint_solver import ConstraintSolver, SolverConfig
+    from exo_windows_porting.distributed.hypergraph import build_hypergraph_topology
+    from exo_windows_porting.distributed.pipeline import DistributedPipelineEngine
+    from exo_windows_porting.distributed.adaptive_scheduler import AdaptiveScheduler
+
+    # Tear down any existing engine first
+    if _dist_engine is not None:
+        try:
+            await _dist_engine.stop()
+        except Exception:
+            pass
+        _dist_engine = None
+        _dist_scheduler = None
+        _dist_hypergraph = None
+
+    node_dicts = [n.dict() for n in req.nodes]
+    topo = build_hypergraph_topology(req.model_id, req.n_layers, node_dicts)
+
+    cfg = SolverConfig(layer_memory_mb=req.layer_memory_mb)
+    try:
+        ConstraintSolver(cfg).solve(topo)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    engine = DistributedPipelineEngine.from_hypergraph(
+        topo, local_mode=req.local_mode
+    )
+
+    scheduler = None
+    if req.enable_scheduler:
+        scheduler = AdaptiveScheduler(
+            topo, imbalance_threshold=req.imbalance_threshold
+        )
+        engine.set_scheduler(scheduler)
+
+    if req.local_mode:
+        await engine.start()
+
+    _dist_engine = engine
+    _dist_scheduler = scheduler
+    _dist_hypergraph = topo
+
+    # Update cluster status counters
+    _cluster_status.total_nodes = len(req.nodes)
+    _cluster_status.active_nodes = len(req.nodes)
+    _cluster_status.total_gpu_memory_gb = sum(n.gpu_memory_mb for n in req.nodes) / 1024
+
+    return {
+        "status": "ok",
+        "topology": topo.to_dict(),
+        "scheduler_enabled": scheduler is not None,
+    }
+
+
+@app.get(
+    "/v1/distributed/topology",
+    dependencies=[Depends(verify_api_key)],
+    summary="Current hypergraph topology",
+)
+async def get_distributed_topology():
+    """Return the current solved HypergraphTopology as JSON."""
+    if _dist_hypergraph is None:
+        return {"active": False, "topology": None}
+    return {"active": True, "topology": _dist_hypergraph.to_dict()}
+
+
+@app.get(
+    "/v1/distributed/scheduler/metrics",
+    dependencies=[Depends(verify_api_key)],
+    summary="Adaptive scheduler metrics",
+)
+async def get_scheduler_metrics():
+    """Return per-shard latency, KV hit rate, and rebalance history."""
+    if _dist_scheduler is None:
+        return {"active": False, "metrics": {}, "rebalance_count": 0}
+    return {
+        "active": True,
+        "metrics": _dist_scheduler.metrics_summary(),
+        "rebalance_count": _dist_scheduler.rebalance_count,
+    }
+
+
+@app.post(
+    "/v1/distributed/stop",
+    dependencies=[Depends(verify_api_key)],
+    summary="Gracefully stop the distributed engine",
+)
+async def stop_distributed():
+    """Stop all local workers and release ZMQ resources."""
+    global _dist_engine, _dist_scheduler, _dist_hypergraph
+    if _dist_engine is None:
+        return {"status": "not_running"}
+    await _dist_engine.stop()
+    _dist_engine = None
+    _dist_scheduler = None
+    _dist_hypergraph = None
+    _cluster_status.total_nodes = 0
+    _cluster_status.active_nodes = 0
+    _cluster_status.total_gpu_memory_gb = 0.0
+    return {"status": "stopped"}
 
 

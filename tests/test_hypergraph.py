@@ -406,6 +406,44 @@ class TestAdaptiveScheduler:
 # Integration: build → solve → schedule → propose
 # ---------------------------------------------------------------------------
 
+class TestTopologyPersistence:
+    def test_to_dict_roundtrip(self):
+        topo = _two_node_topo(n_layers=32)
+        ConstraintSolver(SolverConfig(layer_memory_mb=100)).solve(topo)
+        d = topo.to_dict()
+        restored = HypergraphTopology.from_dict(d)
+        assert restored.model_id == topo.model_id
+        assert restored.n_layers == topo.n_layers
+        assert restored.shard_map == topo.shard_map
+        assert set(restored.nodes.keys()) == set(topo.nodes.keys())
+        assert set(restored.edges.keys()) == set(topo.edges.keys())
+
+    def test_save_load_roundtrip(self, tmp_path):
+        topo = _three_node_topo(n_layers=32)
+        ConstraintSolver(SolverConfig(layer_memory_mb=100)).solve(topo)
+        path = str(tmp_path / "topo.json")
+        topo.save(path)
+        loaded = HypergraphTopology.load(path)
+        assert loaded.shard_map == topo.shard_map
+        assert loaded.model_id == topo.model_id
+
+    def test_dict_preserves_nvlink(self):
+        topo = _two_node_topo(nvlink=True)
+        d = topo.to_dict()
+        restored = HypergraphTopology.from_dict(d)
+        assert restored.nodes["n0"].nvlink is True
+
+    def test_dict_preserves_bandwidth(self):
+        topo = build_hypergraph_topology("m", 32, [
+            {"node_id": "a", "host": "127.0.0.1", "gpu_memory_mb": 8192,
+             "bandwidth_gbps": 400.0},
+            {"node_id": "b", "host": "127.0.0.1", "gpu_memory_mb": 8192},
+        ])
+        d = topo.to_dict()
+        restored = HypergraphTopology.from_dict(d)
+        assert restored.nodes["a"].bandwidth_gbps == 400.0
+
+
 class TestEndToEnd:
     def test_full_pipeline(self):
         """Build topology, solve, run scheduler, propose rebalance."""

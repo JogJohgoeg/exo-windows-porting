@@ -199,6 +199,43 @@
   }
   .metrics-bar span { color: #e2e8f0; }
 
+  table.topo-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.8rem;
+    margin-top: 0.5rem;
+  }
+  .topo-table th {
+    text-align: left;
+    color: #718096;
+    font-weight: 600;
+    padding: 0.3rem 0.5rem;
+    border-bottom: 1px solid #2d3748;
+  }
+  .topo-table td {
+    padding: 0.35rem 0.5rem;
+    border-bottom: 1px solid #1a1d2e;
+    color: #e2e8f0;
+  }
+  .topo-table tr:last-child td { border-bottom: none; }
+  .layer-bar {
+    background: #2d3748;
+    border-radius: 4px;
+    height: 10px;
+    position: relative;
+    overflow: hidden;
+    min-width: 60px;
+  }
+  .layer-fill {
+    background: #7c3aed;
+    height: 100%;
+    border-radius: 4px;
+    transition: width 0.3s;
+  }
+
+  .setup-form { display: flex; flex-direction: column; gap: 0.75rem; }
+  .setup-form textarea { min-height: 80px; font-family: monospace; font-size: 0.8rem; }
+
   .auth-row {
     display: flex;
     align-items: flex-end;
@@ -255,6 +292,59 @@
     </div>
     <div style="margin-top:0.75rem; font-size:0.8rem; color:#718096;">
       Selected: <span id="selected-backend" style="color:#a78bfa;">—</span>
+    </div>
+  </div>
+
+  <!-- Hypergraph Topology -->
+  <div class="card">
+    <h2>Hypergraph Topology</h2>
+    <div id="topo-content">
+      <div class="output-placeholder">No distributed engine configured.<br>Use the Setup panel below to activate.</div>
+    </div>
+  </div>
+
+  <!-- Scheduler Metrics -->
+  <div class="card">
+    <h2>Adaptive Scheduler</h2>
+    <div id="scheduler-content">
+      <div class="output-placeholder">Scheduler inactive.</div>
+    </div>
+  </div>
+
+  <!-- Distributed Setup -->
+  <div class="card" style="grid-column: 1 / -1;">
+    <h2>Distributed Engine Setup</h2>
+    <div class="setup-form">
+      <div class="form-inline" style="grid-template-columns: 1fr 1fr 1fr 1fr;">
+        <div>
+          <label for="ds-model-id">Model ID</label>
+          <input type="text" id="ds-model-id" placeholder="meta-llama/Llama-2-7b-hf">
+        </div>
+        <div>
+          <label for="ds-n-layers">Total Layers</label>
+          <input type="number" id="ds-n-layers" value="32" min="1">
+        </div>
+        <div>
+          <label for="ds-layer-mem">MB/Layer</label>
+          <input type="number" id="ds-layer-mem" value="200" min="1">
+        </div>
+        <div>
+          <label for="ds-local-mode" style="margin-bottom:0.6rem;">Local Mode</label>
+          <label style="display:flex;align-items:center;gap:0.4rem;cursor:pointer;">
+            <input type="checkbox" id="ds-local-mode">
+            <span style="font-size:0.85rem;color:#a0aec0;">Run shards in-process</span>
+          </label>
+        </div>
+      </div>
+      <div>
+        <label for="ds-nodes">Nodes (JSON array)</label>
+        <textarea id="ds-nodes" placeholder='[{"node_id":"n0","host":"127.0.0.1","gpu_memory_mb":8192,"port":29500},{"node_id":"n1","host":"127.0.0.1","gpu_memory_mb":8192,"port":29501}]'></textarea>
+      </div>
+      <div style="display:flex;gap:0.75rem;">
+        <button class="btn-primary" onclick="setupDistributed()">▶ Setup Distributed Engine</button>
+        <button class="btn-secondary" onclick="stopDistributed()">■ Stop Engine</button>
+        <span id="ds-status" style="font-size:0.8rem;color:#718096;align-self:center;"></span>
+      </div>
     </div>
   </div>
 
@@ -566,10 +656,156 @@ async function runBatch(body, t0) {
   }
 }
 
+// ── Topology & Scheduler ─────────────────────────────────────────────────────
+
+async function refreshTopology() {
+  try {
+    const r = await fetch(`${BASE}/v1/distributed/topology`, { headers: getHeaders() });
+    if (!r.ok) return;
+    const d = await r.json();
+    const el = document.getElementById('topo-content');
+
+    if (!d.active || !d.topology) {
+      el.innerHTML = '<div class="output-placeholder">No distributed engine configured.</div>';
+      return;
+    }
+
+    const topo = d.topology;
+    const n_layers = topo.n_layers;
+    const rows = Object.entries(topo.shard_map)
+      .sort((a, b) => a[1][0] - b[1][0])
+      .map(([nid, [s, e]]) => {
+        const node = topo.nodes[nid] || {};
+        const pct = Math.round((e - s) / n_layers * 100);
+        const nvl = node.nvlink ? ' <span class="badge badge-gpu">NVLink</span>' : '';
+        return `<tr>
+          <td>${nid}${nvl}</td>
+          <td>${node.host || '?'}:${node.port || '?'}</td>
+          <td>${(node.gpu_memory_mb / 1024).toFixed(1)} GB</td>
+          <td>${(node.bandwidth_gbps || 0).toFixed(0)} Gbps</td>
+          <td>[${s}, ${e})</td>
+          <td>
+            <div class="layer-bar">
+              <div class="layer-fill" style="width:${pct}%"></div>
+            </div>
+            <span style="font-size:0.7rem;color:#718096;">${e-s}L (${pct}%)</span>
+          </td>
+        </tr>`;
+      }).join('');
+
+    el.innerHTML = `
+      <table class="topo-table">
+        <thead><tr>
+          <th>Node</th><th>Address</th><th>VRAM</th><th>Bandwidth</th><th>Layers</th><th>Share</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <div style="margin-top:0.5rem;font-size:0.75rem;color:#718096;">
+        Model: <span style="color:#a78bfa">${topo.model_id}</span> &nbsp;|&nbsp;
+        Total layers: ${n_layers} &nbsp;|&nbsp;
+        Nodes: ${Object.keys(topo.nodes).length}
+      </div>`;
+  } catch {}
+}
+
+async function refreshScheduler() {
+  try {
+    const r = await fetch(`${BASE}/v1/distributed/scheduler/metrics`, { headers: getHeaders() });
+    if (!r.ok) return;
+    const d = await r.json();
+    const el = document.getElementById('scheduler-content');
+
+    if (!d.active || !Object.keys(d.metrics).length) {
+      el.innerHTML = '<div class="output-placeholder">Scheduler inactive or no data yet.</div>';
+      return;
+    }
+
+    const rows = Object.entries(d.metrics).map(([nid, m]) => {
+      const hitPct = Math.round((m.kv_hit_rate || 0) * 100);
+      return `<tr>
+        <td>${nid}</td>
+        <td>${m.avg_latency_ms} ms</td>
+        <td>${m.p95_latency_ms} ms</td>
+        <td>${hitPct}%</td>
+        <td>${m.tokens_processed}</td>
+      </tr>`;
+    }).join('');
+
+    el.innerHTML = `
+      <table class="topo-table">
+        <thead><tr>
+          <th>Node</th><th>Avg Lat</th><th>p95 Lat</th><th>KV Hit</th><th>Tokens</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <div style="margin-top:0.5rem;font-size:0.75rem;color:#718096;">
+        Rebalances: <span style="color:#a78bfa">${d.rebalance_count}</span>
+      </div>`;
+  } catch {}
+}
+
+async function setupDistributed() {
+  const modelId = document.getElementById('ds-model-id').value.trim();
+  const nLayers = parseInt(document.getElementById('ds-n-layers').value, 10);
+  const layerMem = parseInt(document.getElementById('ds-layer-mem').value, 10);
+  const localMode = document.getElementById('ds-local-mode').checked;
+  const nodesRaw = document.getElementById('ds-nodes').value.trim();
+
+  if (!modelId || !nodesRaw) {
+    document.getElementById('ds-status').textContent = 'Model ID and nodes are required.';
+    return;
+  }
+
+  let nodes;
+  try { nodes = JSON.parse(nodesRaw); }
+  catch { document.getElementById('ds-status').textContent = 'Invalid nodes JSON.'; return; }
+
+  document.getElementById('ds-status').textContent = 'Setting up…';
+  try {
+    const r = await fetch(`${BASE}/v1/distributed/setup`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify({
+        model_id: modelId,
+        n_layers: nLayers,
+        nodes,
+        layer_memory_mb: layerMem,
+        local_mode: localMode,
+        enable_scheduler: true,
+        imbalance_threshold: 0.35,
+      }),
+    });
+    const data = await r.json();
+    if (r.ok) {
+      document.getElementById('ds-status').textContent = '✓ Engine started';
+      await Promise.all([refreshTopology(), refreshScheduler()]);
+    } else {
+      document.getElementById('ds-status').textContent = `Error: ${data.detail || JSON.stringify(data)}`;
+    }
+  } catch (e) {
+    document.getElementById('ds-status').textContent = `Request failed: ${e.message}`;
+  }
+}
+
+async function stopDistributed() {
+  document.getElementById('ds-status').textContent = 'Stopping…';
+  try {
+    await fetch(`${BASE}/v1/distributed/stop`, { method: 'POST', headers: getHeaders() });
+    document.getElementById('ds-status').textContent = '■ Engine stopped';
+    await Promise.all([refreshTopology(), refreshScheduler()]);
+  } catch (e) {
+    document.getElementById('ds-status').textContent = `Error: ${e.message}`;
+  }
+}
+
 // ── Init ─────────────────────────────────────────────────────────────────────
 
 refreshStatus();
+refreshTopology();
+refreshScheduler();
 setInterval(refreshStatus, 10000);
+setInterval(refreshTopology, 15000);
+setInterval(refreshScheduler, 5000);
 </script>
 </body>
 </html>
