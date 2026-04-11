@@ -61,16 +61,32 @@ Quick start (2-node cluster)
     )
 """
 
+from .adaptive_scheduler import AdaptiveScheduler
+from .constraint_solver import ConstraintSolver, SolverConfig, solve_topology
 from .coordinator import ShardCoordinator
+from .hypergraph import HypergraphTopology, HyperNode, HyperEdge, build_hypergraph_topology
 from .pipeline import DistributedPipelineEngine
 from .shard import ClusterTopology, ModelShard, assign_shards
 from .worker import PipelineWorker
 
 __all__ = [
+    # Core engine
     "DistributedPipelineEngine",
     "ShardCoordinator",
     "PipelineWorker",
+    # Classic topology
     "ClusterTopology",
     "ModelShard",
     "assign_shards",
+    # Hypergraph topology
+    "HypergraphTopology",
+    "HyperNode",
+    "HyperEdge",
+    "build_hypergraph_topology",
+    # Constraint solver
+    "ConstraintSolver",
+    "SolverConfig",
+    "solve_topology",
+    # Adaptive scheduler
+    "AdaptiveScheduler",
 ]
