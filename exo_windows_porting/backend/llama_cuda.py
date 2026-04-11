@@ -14,9 +14,10 @@ import os
 class LLamaCudaBackend:
     """llama.cpp CUDA backend wrapper."""
     
-    def __init__(self, model_path: str, device_id: int = 0):
+    def __init__(self, model_path: str, device_id: int = 0, n_ctx: int = 8192):
         self.model_path = model_path
         self.device_id = device_id
+        self.n_ctx = n_ctx
         
         # Initialize llama-cpp-python with CUDA support
         try:
@@ -25,7 +26,7 @@ class LLamaCudaBackend:
             self.llm = Llama(
                 model_path=model_path,
                 n_gpu_layers=-1,  # All layers to GPU (-1 = all)
-                n_ctx=8192,
+                n_ctx=n_ctx,
                 verbose=False
             )
             
@@ -58,13 +59,14 @@ class LLamaCudaBackend:
 
 
 # Factory function for creating CUDA backend instances
-def create_cuda_backend(model_path: str, device_id: int = 0):
+def create_cuda_backend(model_path: str, device_id: int = 0, n_ctx: int = 8192):
     """
     Create a CUDA-accelerated llama.cpp backend.
     
     Args:
         model_path: Path to GGUF model file
         device_id: CUDA device ID (default: 0)
+        n_ctx: Context window size (default: 8192)
         
     Returns:
         LLamaCudaBackend instance
@@ -73,7 +75,7 @@ def create_cuda_backend(model_path: str, device_id: int = 0):
         ImportError: If llama-cpp-python not installed with CUDA support
     """
     
-    return LLamaCudaBackend(model_path=model_path, device_id=device_id)
+    return LLamaCudaBackend(model_path=model_path, device_id=device_id, n_ctx=n_ctx)
 
 
 # Main entry point for testing
