@@ -79,6 +79,13 @@ class ClusterTopology:
     def n_nodes(self) -> int:
         return len(self.shards)
 
+    @property
+    def n_layers_total(self) -> int:
+        """Total transformer layers covered by all shards."""
+        if not self.shards:
+            return 0
+        return max(s.end_layer for s in self.shards)
+
     def shard_for_node(self, node_id: str) -> Optional[ModelShard]:
         for s in self.shards:
             if s.node_id == node_id:

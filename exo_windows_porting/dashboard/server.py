@@ -227,10 +227,27 @@ async def _process_inference_task(
 
 
 async def _stream_inference(request: InferenceRequest) -> AsyncGenerator[str, None]:
-    """Async generator that yields SSE-formatted lines for a streaming request."""
-    from exo_windows_porting.backend.factory import get_backend_factory
+    """
+    Async generator that yields SSE-formatted lines.
 
+    Routes to the distributed engine (if configured) or falls back to the
+    single-node BackendFactory.  Both paths use generate_stream() where
+    available, falling back to a single-chunk emit via generate().
+    """
     try:
+        # ── Distributed engine path ───────────────────────────────────────
+        if _dist_engine is not None:
+            async for token in _dist_engine.generate_stream(
+                request.prompt, max_tokens=request.max_tokens
+            ):
+                yield f"data: {json.dumps({'token': token})}\n\n"
+                await asyncio.sleep(0)
+            yield "data: [DONE]\n\n"
+            return
+
+        # ── Single-node backend path ──────────────────────────────────────
+        from exo_windows_porting.backend.factory import get_backend_factory
+
         factory = get_backend_factory()
 
         if request.gpu_required and (
@@ -245,19 +262,15 @@ async def _stream_inference(request: InferenceRequest) -> AsyncGenerator[str, No
             force_cpu=False,
         )
 
-        # Use generate_stream if available, otherwise fall back to generate()
         if hasattr(backend, "generate_stream"):
             async for token in backend.generate_stream(
                 request.prompt, max_tokens=request.max_tokens
             ):
-                payload = json.dumps({"token": token})
-                yield f"data: {payload}\n\n"
-                await asyncio.sleep(0)   # yield control to event loop
+                yield f"data: {json.dumps({'token': token})}\n\n"
+                await asyncio.sleep(0)
         else:
-            # Fallback: run generate() and emit the whole text as one chunk
             text = await backend.generate(
-                prompt=request.prompt,
-                max_tokens=request.max_tokens,
+                prompt=request.prompt, max_tokens=request.max_tokens,
             )
             yield f"data: {json.dumps({'token': text})}\n\n"
 
@@ -421,8 +434,25 @@ async def upload_model(
     dependencies=[Depends(verify_api_key)],
 )
 async def get_cluster_status():
-    """Get current cluster status."""
+    """Get current cluster status (live data from hypergraph when active)."""
     _cluster_status.uptime_seconds = round(time.time() - _server_start_time, 1)
+
+    if _dist_hypergraph is not None:
+        nodes = _dist_hypergraph.nodes
+        _cluster_status.total_nodes = len(nodes)
+        _cluster_status.active_nodes = len(nodes)
+        _cluster_status.total_gpu_memory_gb = round(
+            sum(n.gpu_memory_mb for n in nodes.values()) / 1024, 2
+        )
+        if _dist_scheduler is not None:
+            metrics = _dist_scheduler.metrics_summary()
+            lats = [m["avg_latency_ms"] for m in metrics.values() if m["avg_latency_ms"] > 0]
+            if lats:
+                # Report load as a fraction of the slowest possible latency (capped at 100 %)
+                _cluster_status.average_load_percent = round(
+                    min(100.0, sum(lats) / len(lats) / 100), 1
+                )
+
     return _cluster_status
 
 

@@ -40,7 +40,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
+
+_MAX_WORKER_RESTARTS = 3   # per worker, per engine lifetime
 
 from ..backend.base import LLMBackend
 from .coordinator import ShardCoordinator
@@ -94,6 +96,7 @@ class DistributedPipelineEngine(LLMBackend):
 
         self._workers: List[PipelineWorker] = []
         self._worker_tasks: List[asyncio.Task] = []
+        self._worker_restart_counts: Dict[str, int] = {}
         self._coordinator = ShardCoordinator(
             topology,
             results_port=results_port,
@@ -354,11 +357,88 @@ class DistributedPipelineEngine(LLMBackend):
             logger.debug("Worker %s task cancelled", node_id)
             return
         exc = task.exception()
-        if exc is not None:
+        if exc is None:
+            return   # completed normally (e.g. _running=False drain)
+
+        logger.error(
+            "Worker %s crashed: %s",
+            node_id, exc, exc_info=exc,
+        )
+
+        # Attempt automatic restart for local workers (only while engine is up)
+        if not self._started:
+            return
+        restarts = self._worker_restart_counts.get(node_id, 0)
+        if restarts >= _MAX_WORKER_RESTARTS:
             logger.error(
-                "Worker %s crashed — pipeline may be stalled: %s",
-                node_id, exc, exc_info=exc,
+                "Worker %s has crashed %d time(s) — not restarting",
+                node_id, restarts,
             )
+            return
+
+        delay = 2.0 ** restarts   # 1 s, 2 s, 4 s
+        self._worker_restart_counts[node_id] = restarts + 1
+        logger.warning(
+            "Scheduling restart of worker %s (#%d) in %.0f s",
+            node_id, restarts + 1, delay,
+        )
+        asyncio.create_task(
+            self._delayed_restart_worker(node_id, delay),
+            name=f"restart-{node_id}",
+        )
+
+    async def _delayed_restart_worker(self, node_id: str, delay: float) -> None:
+        """Wait `delay` seconds then restart a crashed local worker."""
+        await asyncio.sleep(delay)
+        if not self._started:
+            return   # engine was stopped while we were waiting
+
+        shard = self.topology.shard_for_node(node_id)
+        if shard is None:
+            logger.error("Cannot restart %s: shard not found", node_id)
+            return
+
+        local_idx = next(
+            (i for i, s in enumerate(self.local_shards) if s.node_id == node_id),
+            None,
+        )
+        if local_idx is None:
+            logger.error("Cannot restart %s: not a local shard", node_id)
+            return
+
+        device = (
+            self.local_devices[local_idx]
+            if local_idx < len(self.local_devices)
+            else "cpu"
+        )
+        next_shard = self.topology.next_shard(node_id)
+
+        worker = PipelineWorker(
+            shard=shard,
+            model_id=self.topology.model_id,
+            next_worker_host=next_shard.host if next_shard else None,
+            next_worker_port=next_shard.inference_port if next_shard else None,
+            coordinator_host=self.coordinator_host,
+            coordinator_results_port=self.results_port,
+            device=device,
+        )
+        try:
+            await worker.start()
+        except Exception as exc:
+            logger.error("Failed to restart worker %s: %s", node_id, exc)
+            return
+
+        # Replace in worker list
+        self._workers = [
+            worker if w.shard.node_id == node_id else w
+            for w in self._workers
+        ]
+        task = asyncio.create_task(worker.run(), name=f"worker-{node_id}")
+        task.add_done_callback(
+            lambda t, nid=node_id: self._on_worker_done(t, nid)
+        )
+        self._worker_tasks.append(task)
+        logger.info("Worker %s restarted successfully", node_id)
 
     async def stop(self, drain_timeout: float = 5.0) -> None:
         """Stop all local workers and the coordinator."""
