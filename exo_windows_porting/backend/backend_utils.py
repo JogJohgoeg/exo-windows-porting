@@ -153,14 +153,20 @@ def check_rocm_availability() -> Dict[str, Any]:
     
     try:
         # Check for rocm-smi command (ROCm system management interface)
-        subprocess.run(
+        proc = subprocess.run(
             ["rocm-smi", "--showproductname"],
             capture_output=True,
             text=True,
             timeout=5
         )
         
-        result["available"] = True
+        # Only mark as available when rocm-smi exits successfully (returncode == 0).
+        # Previously this was set to True unconditionally before checking returncode,
+        # which caused false positives when rocm-smi exists but fails.
+        if proc.returncode == 0:
+            result["available"] = True
+        else:
+            result["error"] = f"rocm-smi returned non-zero exit code {proc.returncode}."
         
     except FileNotFoundError:
         result["error"] = "rocm-smi command not found. ROCm may not be installed."
